@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 project(chfloat LANGUAGES CXX)
 
 option(CHFLOAT_BUILD_TESTS "Build chfloat tests" ON)
-option(CHFLOAT_BUILD_BENCHMARKS "Build chfloat benchmarks" ON)
+option(CHFLOAT_BUILD_BENCHMARKS "Build chfloat benchmarks" OFF)
 
 add_library(chfloat INTERFACE)
 add_library(chfloat::chfloat ALIAS chfloat)
