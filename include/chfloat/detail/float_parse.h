@@ -725,7 +725,7 @@ static inline bin32 build_binary32(i32 q10, u64 w) noexcept {
   return {static_cast<u32>(m), e2};
 }
 
-fp_chars_result parse_fp_double(const char* first, const char* last, double& value) noexcept {
+static inline fp_chars_result parse_fp_double(const char* first, const char* last, double& value) noexcept {
   // Handle optional leading sign for special tokens.
   const char* p = first;
   bool neg = false;
@@ -848,7 +848,7 @@ fp_chars_result parse_fp_double(const char* first, const char* last, double& val
   return {d.ptr, fp_ok};
 }
 
-fp_chars_result parse_fp_float(const char* first, const char* last, float& value) noexcept {
+static inline fp_chars_result parse_fp_float(const char* first, const char* last, float& value) noexcept {
   const char* p = first;
   bool neg = false;
   if (p < last && (*p == '-' || *p == '+')) {
