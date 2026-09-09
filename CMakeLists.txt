@@ -1,36 +1,134 @@
 cmake_minimum_required(VERSION 3.16)
-project(chfloat LANGUAGES CXX)
+project(chfloat VERSION 0.2.0 LANGUAGES CXX)
+include(GNUInstallDirs)
 
-option(CHFLOAT_BUILD_TESTS "Build chfloat tests" ON)
-option(CHFLOAT_BUILD_BENCHMARKS "Build chfloat benchmarks" OFF)
+option(CHFLOAT_BUILD_TESTS "Build correctness, portability and allocation tests" ON)
+option(CHFLOAT_BUILD_BENCHMARKS "Build standalone benchmarks" OFF)
+option(CHFLOAT_ENABLE_SANITIZERS "Enable address sanitizer (and UB sanitizer where supported)" OFF)
+option(CHFLOAT_COMPACT "Halve cached-power storage, using more exact midpoint fallbacks" OFF)
+set(CHFLOAT_FAST_FLOAT_INCLUDE_DIR "" CACHE PATH "Optional fast_float include directory for benchmarks")
+set(CHFLOAT_BASELINE_INCLUDE_DIR "" CACHE PATH "Optional old chfloat include directory for same-harness comparisons")
 
 add_library(chfloat INTERFACE)
 add_library(chfloat::chfloat ALIAS chfloat)
-
 target_compile_features(chfloat INTERFACE cxx_std_17)
-
+if(CHFLOAT_COMPACT)
+  target_compile_definitions(chfloat INTERFACE CHFLOAT_COMPACT=1)
+endif()
 target_include_directories(chfloat INTERFACE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-)
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
-if (CHFLOAT_BUILD_TESTS)
+function(chfloat_configure_target target)
+  if(MSVC)
+    target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8)
+  else()
+    target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+  # Allocation counting replaces operator new; Windows ASan replaces it too.
+  if(CHFLOAT_ENABLE_SANITIZERS AND NOT target STREQUAL "chfloat_memory_tests")
+    if(MSVC)
+      target_compile_options(${target} PRIVATE /fsanitize=address /Zi)
+      target_link_options(${target} PRIVATE /INCREMENTAL:NO)
+    elseif(WIN32)
+      target_compile_options(${target} PRIVATE -fsanitize=address -shared-libasan -fno-omit-frame-pointer)
+      target_link_options(${target} PRIVATE -fsanitize=address -shared-libasan)
+      execute_process(COMMAND "${CMAKE_CXX_COMPILER}" -print-resource-dir
+        OUTPUT_VARIABLE clang_resource_dir OUTPUT_STRIP_TRAILING_WHITESPACE)
+      file(GLOB asan_dll "${clang_resource_dir}/lib/windows/clang_rt.asan_dynamic-*.dll")
+      foreach(runtime IN LISTS asan_dll)
+        add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${runtime}" "$<TARGET_FILE_DIR:${target}>")
+      endforeach()
+    else()
+      target_compile_options(${target} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+      target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+    endif()
+  endif()
+endfunction()
+
+if(CHFLOAT_BUILD_TESTS)
   enable_testing()
-  add_executable(chfloat_tests
-    test/test_main.cpp
-  )
-  target_link_libraries(chfloat_tests PRIVATE chfloat::chfloat)
-  add_test(NAME chfloat_tests COMMAND chfloat_tests)
+  foreach(target chfloat_tests chfloat_portable_tests chfloat_compact_tests)
+    add_executable(${target} test/test_main.cpp)
+    target_link_libraries(${target} PRIVATE chfloat::chfloat)
+    chfloat_configure_target(${target})
+    add_test(NAME ${target} COMMAND ${target})
+  endforeach()
+  target_compile_definitions(chfloat_portable_tests PRIVATE CHFLOAT_FORCE_PORTABLE=1)
+  target_compile_definitions(chfloat_compact_tests PRIVATE CHFLOAT_COMPACT=1)
+  add_executable(chfloat_memory_tests test/memory_main.cpp)
+  target_link_libraries(chfloat_memory_tests PRIVATE chfloat::chfloat)
+  chfloat_configure_target(chfloat_memory_tests)
+  add_test(NAME chfloat_memory_tests COMMAND chfloat_memory_tests)
 endif()
 
-if (CHFLOAT_BUILD_BENCHMARKS)
-  add_executable(chfloat_benchmark
-    benchmark/benchmark_main.cpp
-  )
+if(CHFLOAT_BUILD_BENCHMARKS)
+  add_executable(chfloat_benchmark benchmark/benchmark_main.cpp)
   target_link_libraries(chfloat_benchmark PRIVATE chfloat::chfloat)
-  target_compile_definitions(chfloat_benchmark PRIVATE
-    CHFLOAT_PROJECT_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
-  )
-  target_include_directories(chfloat_benchmark PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../fast_float/include
-  )
+  chfloat_configure_target(chfloat_benchmark)
+  add_executable(chfloat_footprint benchmark/footprint_main.cpp)
+  target_link_libraries(chfloat_footprint PRIVATE chfloat::chfloat)
+  chfloat_configure_target(chfloat_footprint)
+  if(CHFLOAT_FAST_FLOAT_INCLUDE_DIR)
+    if(NOT EXISTS "${CHFLOAT_FAST_FLOAT_INCLUDE_DIR}/fast_float/fast_float.h")
+      message(FATAL_ERROR "CHFLOAT_FAST_FLOAT_INCLUDE_DIR must contain fast_float/fast_float.h")
+    endif()
+    target_include_directories(chfloat_benchmark PRIVATE "${CHFLOAT_FAST_FLOAT_INCLUDE_DIR}")
+    target_compile_definitions(chfloat_benchmark PRIVATE CHFLOAT_HAS_FAST_FLOAT=1)
+  endif()
+  if(CHFLOAT_BASELINE_INCLUDE_DIR)
+    if(NOT EXISTS "${CHFLOAT_BASELINE_INCLUDE_DIR}/chfloat/chfloat.h")
+      message(FATAL_ERROR "CHFLOAT_BASELINE_INCLUDE_DIR must contain chfloat/chfloat.h")
+    endif()
+    # A private namespace lets the same process time both revisions in
+    # alternating order, reducing frequency and scheduler bias.
+    file(GLOB_RECURSE reference_headers RELATIVE "${CHFLOAT_BASELINE_INCLUDE_DIR}/chfloat"
+      "${CHFLOAT_BASELINE_INCLUDE_DIR}/chfloat/*.h")
+    set(reference_dir "${CMAKE_CURRENT_BINARY_DIR}/reference-include")
+    foreach(header IN LISTS reference_headers)
+      set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${CHFLOAT_BASELINE_INCLUDE_DIR}/chfloat/${header}")
+      file(READ "${CHFLOAT_BASELINE_INCLUDE_DIR}/chfloat/${header}" reference_content)
+      string(REPLACE "chfloat/" "chfloat_reference/" reference_content "${reference_content}")
+      string(REPLACE "namespace chfloat" "namespace chfloat_reference" reference_content "${reference_content}")
+      get_filename_component(header_dir "${reference_dir}/chfloat_reference/${header}" DIRECTORY)
+      file(MAKE_DIRECTORY "${header_dir}")
+      set(reference_output "${reference_dir}/chfloat_reference/${header}")
+      set(existing_reference "")
+      if(EXISTS "${reference_output}")
+        file(READ "${reference_output}" existing_reference)
+      endif()
+      if(NOT existing_reference STREQUAL reference_content)
+        file(WRITE "${reference_output}" "${reference_content}")
+      endif()
+    endforeach()
+    file(SHA256 "${CHFLOAT_BASELINE_INCLUDE_DIR}/chfloat/detail/float_parse.h" reference_hash)
+    target_include_directories(chfloat_benchmark PRIVATE "${reference_dir}")
+    target_compile_definitions(chfloat_benchmark PRIVATE CHFLOAT_HAS_REFERENCE=1
+      CHFLOAT_REFERENCE_HASH="${reference_hash}")
+    foreach(kind benchmark footprint)
+      add_executable(chfloat_${kind}_baseline benchmark/${kind}_main.cpp)
+      target_compile_features(chfloat_${kind}_baseline PRIVATE cxx_std_17)
+      target_include_directories(chfloat_${kind}_baseline PRIVATE "${CHFLOAT_BASELINE_INCLUDE_DIR}")
+      target_compile_definitions(chfloat_${kind}_baseline PRIVATE CHFLOAT_BASELINE=1)
+      if(CHFLOAT_COMPACT)
+        target_compile_definitions(chfloat_${kind}_baseline PRIVATE CHFLOAT_COMPACT=1)
+      endif()
+      chfloat_configure_target(chfloat_${kind}_baseline)
+    endforeach()
+  endif()
 endif()
+
+include(CMakePackageConfigHelpers)
+install(TARGETS chfloat EXPORT chfloatTargets)
+install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(EXPORT chfloatTargets NAMESPACE chfloat:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/chfloat)
+configure_package_config_file(cmake/chfloatConfig.cmake.in
+  "${CMAKE_CURRENT_BINARY_DIR}/chfloatConfig.cmake"
+  INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/chfloat)
+write_basic_package_version_file("${CMAKE_CURRENT_BINARY_DIR}/chfloatConfigVersion.cmake"
+  VERSION ${PROJECT_VERSION} COMPATIBILITY SameMajorVersion)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/chfloatConfig.cmake"
+  "${CMAKE_CURRENT_BINARY_DIR}/chfloatConfigVersion.cmake"
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/chfloat)

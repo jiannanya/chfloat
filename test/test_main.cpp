@@ -1,204 +1,299 @@
 #include <chfloat/chfloat.h>
-
+#include <array>
+#include <cfenv>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
-#include <cstdlib>
 #include <cstdio>
-#include <iostream>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <random>
 #include <string>
 #include <string_view>
 #include <type_traits>
-#include <vector>
 
 namespace {
-static int g_failures = 0;
-
-#define CHECK(expr)                                                                 \
-  do {                                                                              \
-    if (!(expr)) {                                                                 \
-      std::fprintf(stderr, "CHECK failed: %s (%s:%d)\n", #expr, __FILE__, __LINE__); \
-      std::fflush(stderr);                                                         \
-      ++g_failures;                                                                \
-    }                                                                              \
-  } while (0)
-
-template <class T>
-static T make_nan() {
-  return std::numeric_limits<T>::quiet_NaN();
+#include "midpoint_cases.h"
+int failures = 0;
+std::uint64_t comparisons = 0;
+#define CHECK(expr) do { if (!(expr)) { if (failures < 30) std::fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #expr); ++failures; } } while (false)
+template <class T> std::uint64_t bits(T value) {
+  std::uint64_t result = 0;
+  std::memcpy(&result, &value, sizeof(T));
+  return result;
 }
-
-template <class T>
-static bool is_nan(T v) {
-  return std::isnan(v);
-}
-
-template <class T>
-static bool is_inf(T v) {
-  return std::isinf(v);
-}
-
-template <class T>
-static uint64_t bitcast_u64(T v) {
-  static_assert(sizeof(T) <= sizeof(uint64_t), "unexpected size");
-  uint64_t out = 0;
-  std::memcpy(&out, &v, sizeof(T));
-  return out;
-}
-
-template <class T>
-static bool equal_or_both_nan(T a, T b) {
-  if (is_nan(a) && is_nan(b)) return true;
-  // Treat +0 and -0 as equal in numeric sense
-  if (a == T(0) && b == T(0)) return true;
-  return a == b;
-}
-
-template <class T>
-static void test_parse_ok(std::string_view s, T expected, chfloat::chars_format fmt = chfloat::chars_format::general) {
-  T out = T(0);
-  auto r = chfloat::from_chars(s.data(), s.data() + s.size(), out, fmt);
-  CHECK(r.ec == chfloat::errc::ok);
-  CHECK(r.ptr == s.data() + s.size());
-  if (!equal_or_both_nan(out, expected)) {
-    // If it's a special value, validate category.
-    if (is_nan(expected)) {
-      CHECK(is_nan(out));
-    } else if (is_inf(expected)) {
-      CHECK(is_inf(out));
-      CHECK(std::signbit(out) == std::signbit(expected));
-    } else {
-      // Last-resort: compare bitwise equality for exact strings.
-      CHECK(bitcast_u64(out) == bitcast_u64(expected));
-    }
+std::chars_format std_format(chfloat::chars_format fmt) {
+  switch (fmt) {
+    case chfloat::chars_format::fixed: return std::chars_format::fixed;
+    case chfloat::chars_format::scientific: return std::chars_format::scientific;
+    case chfloat::chars_format::hex: return std::chars_format::hex;
+    default: return std::chars_format::general;
   }
 }
-
-template <class T>
-static void test_parse_err(std::string_view s) {
-  T out = T(123);
-  auto r = chfloat::from_chars(s.data(), s.data() + s.size(), out);
-  CHECK(r.ec != chfloat::errc::ok);
+template <class T> void compare(std::string_view s, chfloat::chars_format fmt = chfloat::chars_format::general) {
+  T actual = T(123), expected = T(123);
+  const char* first = s.data();
+  const char* last = first + s.size();
+  // chfloat intentionally retains its leading-plus extension.
+  const char* oracle = first != last && *first == '+' ? first + 1 : first;
+  auto want = std::from_chars(oracle, last, expected, std_format(fmt));
+  if (oracle != first && oracle != last && (*oracle == '+' || *oracle == '-')) want.ec = std::errc::invalid_argument;
+  if (want.ec == std::errc::invalid_argument) want.ptr = first;
+  // Older MSVC libraries overwrite the destination on range errors.
+  if (want.ec != std::errc{}) expected = T(123);
+  auto got = chfloat::from_chars(first, last, actual, fmt);
+  const auto ec = want.ec == std::errc{} ? chfloat::errc::ok :
+      want.ec == std::errc::invalid_argument ? chfloat::errc::invalid_argument : chfloat::errc::result_out_of_range;
+  const bool equal = (std::isnan(actual) && std::isnan(expected) && std::signbit(actual) == std::signbit(expected)) || bits(actual) == bits(expected);
+  ++comparisons;
+  if (got.ec != ec || got.ptr != want.ptr || !equal) {
+    if (failures < 30) std::fprintf(stderr, "Mismatch %s fmt=%u input=%.160s size=%zu ec=%d/%d ptr=%td/%td bits=%llx/%llx\n",
+        sizeof(T) == 4 ? "float" : "double", unsigned(fmt), std::string(s).c_str(), s.size(), int(got.ec), int(ec),
+        got.ptr - first, want.ptr - first, (unsigned long long)bits(actual), (unsigned long long)bits(expected));
+    ++failures;
+  }
 }
-
-template <class T>
-static void test_parse_partial_ok(std::string_view s) {
-  T out = T(0);
-  auto r = chfloat::from_chars(s.data(), s.data() + s.size(), out);
-  CHECK(r.ec == chfloat::errc::ok);
-  // Must consume at least 1 char, but not necessarily the whole string.
-  CHECK(r.ptr > s.data());
-  CHECK(r.ptr < s.data() + s.size());
-}
-
-static void test_float_double_basic() {
-  test_parse_ok<float>("0", 0.0f);
-  test_parse_ok<float>("-0", -0.0f);
-  test_parse_ok<float>("1", 1.0f);
-  test_parse_ok<float>("-1", -1.0f);
-  test_parse_ok<float>("3.1415926", 3.1415926f);
-  test_parse_ok<float>("1e10", 1e10f);
-  test_parse_ok<float>("1E-10", 1e-10f);
-
-  test_parse_ok<double>("0", 0.0);
-  test_parse_ok<double>("-0", -0.0);
-  test_parse_ok<double>("1", 1.0);
-  test_parse_ok<double>("-1", -1.0);
-  test_parse_ok<double>("3.141592653589793", 3.141592653589793);
-  test_parse_ok<double>("1e308", 1e308);
-  test_parse_ok<double>("1e-308", 1e-308);
-}
-
-static void test_float_specials_if_supported() {
-  // std::from_chars floating parsing support varies across standard libraries.
-  // We only assert that these don't crash; result may be invalid_argument.
-  const std::string_view cases[] = {"nan", "NaN", "inf", "-inf", "infinity"};
+template <class T> void regression() {
+  constexpr std::string_view cases[] = {
+    "", " ", "abc", "+", "-", ".", "+.", "--1", "+-1", "1..0", "1e", "1e+", "1e-", ".5tail", "1.e2!",
+    "0", "-0", "+0", "-0.000e999999", "0000000000000000000000000001", "0.000000000000000000000001",
+    "12345678901234567890.12345678901234567890", "1.23456789012345678901234567890123456789",
+    "3.14159265358979323846264338327950288419716939937510", "9007199254740993", "18446744073709551615",
+    "99999999999999999999999999999999", "1.000000059604644775390625", "1.00000005960464477539062500000001",
+    "1.00000005960464477539062499999999", "1.000000178813934326171875", "16777217", "16777219",
+    "1.00000000000000011102230246251565404236316680908203125",
+    "1.000000000000000111022302462515654042363166809082031250000001",
+    "1.000000000000000111022302462515654042363166809082031249999999",
+    "1.7976931348623157e308", "1.7976931348623158e308", "1.7976931348623159e308", "1e309", "1e-400",
+    "2.2250738585072014e-308", "2.2250738585072011e-308", "4.9406564584124654e-324", "2.4703282292062327e-324",
+    "2.4703282292062328e-324", "3.4028234663852886e38", "3.4028235677973366e38", "3.4028235677973367e38",
+    "1.1754943508222875e-38", "1.1754942106924411e-38", "1.401298464324817e-45", "7.006492321624085e-46",
+    "1e99999999999999999999999999999999", "1e-9999999999999999999999999999999",
+    "nan", "NaN", "-nan", "+nan", "nan()", "NaN(payload_123)", "nan(unclosed", "nan(a-b)", "nan(\xff)",
+    "inf", "-INF", "infinity", "+InFiNiTy", "infinite", "Infinity!", "nanometer", "\xff", "1\xff"
+  };
   for (auto s : cases) {
-    double out = 0;
-    (void)chfloat::from_chars(s.data(), s.data() + s.size(), out);
+    compare<T>(s);
+    compare<T>(s, chfloat::chars_format::fixed);
+    compare<T>(s, chfloat::chars_format::scientific);
   }
+  for (auto s : {"0", "-0", "1p0", "1.8p1", "0x1p2", "1p", "1p+", ".fp-1", "f.fp10!", "1.fffffffffffff8p1023",
+                 "1p-1075", "1.00000000000000000000000001p-1075", "1p-1074", "1p-149", "1p-150", "1.000001p-150",
+                 "1.fffffep127", "1.ffffffp127", "1p999999999999999999999", "0p999999999999999999999", "@", "`", "f@"})
+    compare<T>(s, chfloat::chars_format::hex);
+  for (std::size_t length : {20u, 100u, 1000u, 100000u}) {
+    compare<T>(std::string(length, '0') + "1");
+    compare<T>("0." + std::string(length, '0') + "1e" + std::to_string(length));
+    compare<T>("1" + std::string(length, '0') + "e-" + std::to_string(length));
+    compare<T>("1.00000000000000011102230246251565404236316680908203125" + std::string(length, '0') + "1");
+  }
+  const char raw[] = {'1', '.', '2', '5', '\0', '9'};
+  for (std::size_t length = 0; length <= sizeof(raw); ++length) compare<T>(std::string_view(raw, length));
+  T value = T(99);
+  auto r = chfloat::from_chars(nullptr, nullptr, value);
+  CHECK(r.ptr == nullptr && r.ec == chfloat::errc::invalid_argument && value == T(99));
+  const char* invalid_format = "123";
+  r = chfloat::from_chars(invalid_format, invalid_format + 3, value, static_cast<chfloat::chars_format>(99));
+  CHECK(r.ptr == invalid_format && r.ec == chfloat::errc::invalid_argument && value == T(99));
+  const char* ws = " \t\n\r\f\v-1.25e2!";
+  r = chfloat::from_chars_ws(ws, ws + std::strlen(ws), value, chfloat::chars_format::scientific);
+  CHECK(r.ec == chfloat::errc::ok && *r.ptr == '!' && value == T(-125));
 }
-
-static void test_float_errors() {
-  test_parse_err<float>("");
-  test_parse_err<float>(" ");
-  test_parse_err<float>("abc");
-  test_parse_err<float>("--1");
-  test_parse_partial_ok<float>("1..0");
-
-  test_parse_err<double>("");
-  test_parse_err<double>("abc");
-  test_parse_err<double>("1e9999"); // out of range
-}
-
-static void test_ws_variant() {
-  float out = 0;
-  const char* first = "  \t\n-12.5";
-  const char* last = first + std::strlen(first);
-  auto r = chfloat::from_chars_ws(first, last, out);
-  CHECK(r.ec == chfloat::errc::ok);
-  CHECK(out == -12.5f);
-}
-
-static void test_int_basic() {
-  int64_t v = 0;
-  {
-    const char* first = "-123";
-    const char* last = first + 4;
-    auto r = chfloat::from_chars(first, last, v);
-    if (r.ec != chfloat::errc::ok) {
-      std::fprintf(stderr, "int64 parse failed: ec=%d, consumed=%td, v=%lld\n",
-                   (int)r.ec, r.ptr - first, (long long)v);
-      std::fflush(stderr);
+template <class T> void integer_tests() {
+  std::mt19937_64 rng(901);
+  for (int base = 2; base <= 36; ++base) {
+    for (int i = 0; i < 200; ++i) {
+      T input = static_cast<T>(rng());
+      if (i == 0) input = (std::numeric_limits<T>::min)();
+      if (i == 1) input = (std::numeric_limits<T>::max)();
+      char data[160];
+      auto written = std::to_chars(data, data + sizeof(data) - 1, input, base);
+      *written.ptr = '!';
+      T actual = 0;
+      auto got = chfloat::from_chars(data, written.ptr + 1, actual, base);
+      CHECK(got.ec == chfloat::errc::ok && got.ptr == written.ptr && actual == input);
+      ++comparisons;
     }
-    CHECK(r.ec == chfloat::errc::ok);
-    CHECK(v == -123);
+    std::string overflow(200, '1');
+    T value = T(42);
+    auto got = chfloat::from_chars(overflow.data(), overflow.data() + overflow.size(), value, base);
+    CHECK(got.ec == chfloat::errc::result_out_of_range && got.ptr == overflow.data() + overflow.size() && value == T(42));
   }
-  {
-    uint32_t u = 0;
-    const char* first = "ff";
-    const char* last = first + 2;
-    auto r = chfloat::from_chars(first, last, u, 16);
-    if (r.ec != chfloat::errc::ok) {
-      std::fprintf(stderr, "u32 hex parse failed: ec=%d, consumed=%td, u=%u\n",
-                   (int)r.ec, r.ptr - first, (unsigned)u);
-      std::fflush(stderr);
-    }
-    CHECK(r.ec == chfloat::errc::ok);
-    CHECK(u == 255u);
+  T value = T(42);
+  const char* invalid = "+";
+  auto got = chfloat::from_chars(invalid, invalid + 1, value);
+  CHECK(got.ec == chfloat::errc::invalid_argument && got.ptr == invalid && value == T(42));
+  for (int base : {-1, 0, 1, 37, 100}) {
+    got = chfloat::from_chars(invalid, invalid + 1, value, base);
+    CHECK(got.ec == chfloat::errc::invalid_argument && got.ptr == invalid && value == T(42));
   }
-  {
-    int x = 0;
-    // INT_MAX + 1
-    const char* first = "2147483648";
-    const char* last = first + 10;
-    auto r = chfloat::from_chars(first, last, x);
-    if (r.ec != chfloat::errc::result_out_of_range) {
-      std::fprintf(stderr, "int overflow parse unexpected: ec=%d, consumed=%td, x=%d\n",
-                   (int)r.ec, r.ptr - first, x);
-      std::fflush(stderr);
+  const char* ws = " \t42!";
+  got = chfloat::from_chars_ws(ws, ws + 5, value);
+  CHECK(got.ec == chfloat::errc::ok && value == T(42) && *got.ptr == '!');
+  if constexpr (std::is_signed<T>::value) {
+    const char* plus = "+42";
+    got = chfloat::from_chars(plus, plus + 3, value);
+    CHECK(got.ec == chfloat::errc::ok && value == T(42));
+  } else {
+    for (auto s : {"+42", "-1"}) {
+      got = chfloat::from_chars(s, s + std::strlen(s), value);
+      CHECK(got.ec == chfloat::errc::invalid_argument && got.ptr == s);
     }
-    CHECK(r.ec == chfloat::errc::result_out_of_range);
   }
 }
-
-
-static void test_parse_digit() {
-  unsigned d = 999;
-  CHECK(chfloat::parse_digit('0', d) && d == 0u);
-  CHECK(chfloat::parse_digit('9', d) && d == 9u);
-  CHECK(!chfloat::parse_digit('a', d));
+void random_decimal(std::size_t count) {
+  std::mt19937_64 rng(0xcef123);
+  std::string s;
+  s.reserve(600);
+  for (std::size_t i = 0; i < count; ++i) {
+    s.clear();
+    if (rng() & 1) s += '-';
+    const std::size_t n = 1 + rng() % (i % 10 == 0 ? 500 : 40);
+    const std::size_t point = rng() % (n + 1);
+    for (std::size_t j = 0; j < n; ++j) { if (j == point) s += '.'; s += char('0' + rng() % 10); }
+    if (rng() % 4) { s += 'e'; s += std::to_string(int(rng() % 800) - 450); }
+    if (rng() % 5 == 0) s += '!';
+    compare<float>(s);
+    compare<double>(s);
+    if (i % 10 == 0) {
+      compare<float>(s, chfloat::chars_format::fixed);
+      compare<double>(s, chfloat::chars_format::scientific);
+    }
+  }
 }
-
+template <class T> void roundtrips(std::size_t count) {
+  std::mt19937_64 rng(0xabbacddc);
+  for (std::size_t i = 0; i < count; ++i) {
+    std::uint64_t raw = rng();
+    T value;
+    std::memcpy(&value, &raw, sizeof(T));
+    if (!std::isfinite(value)) continue;
+    char buffer[128];
+    for (auto fmt : {chfloat::chars_format::general, chfloat::chars_format::scientific, chfloat::chars_format::hex}) {
+      const auto r = std::to_chars(buffer, buffer + sizeof(buffer), value, std_format(fmt));
+      CHECK(r.ec == std::errc{});
+      compare<T>(std::string_view(buffer, std::size_t(r.ptr - buffer)), fmt);
+      T actual = 0;
+      const auto parsed = chfloat::from_chars(buffer, r.ptr, actual, fmt);
+      CHECK(parsed.ec == chfloat::errc::ok && bits(actual) == bits(value));
+    }
+  }
+}
+void rounding_modes() {
+  const int original = std::fegetround();
+  for (int mode : {FE_TONEAREST, FE_UPWARD, FE_DOWNWARD, FE_TOWARDZERO}) {
+    if (std::fesetround(mode)) continue;
+    double d = 0;
+    float f = 0;
+    const char* text = "0.1";
+    auto rd = chfloat::from_chars(text, text + 3, d);
+    auto rf = chfloat::from_chars(text, text + 3, f);
+    CHECK(rd.ec == chfloat::errc::ok && bits(d) == 0x3fb999999999999aULL);
+    CHECK(rf.ec == chfloat::errc::ok && bits(f) == 0x3dcccccdULL);
+    CHECK(std::fegetround() == mode);
+  }
+  std::fesetround(original);
+}
+void short_decimal_rounding() {
+  const int original = std::fegetround();
+  std::fesetround(FE_TONEAREST);
+  std::mt19937 rng(0x98512);
+  for (unsigned i = 0; i < 100000; ++i) {
+    const unsigned mantissa = i < 50000 ? i : rng() % 100000000;
+    for (unsigned scale = 0; scale <= 2; ++scale) {
+      char buffer[32];
+      char* end = std::to_chars(buffer, buffer + 24, mantissa).ptr;
+      *end++ = 'e'; *end++ = '-'; *end++ = char('0' + scale);
+      compare<float>({buffer, std::size_t(end - buffer)});
+      compare<double>({buffer, std::size_t(end - buffer)});
+      if (i % 100 == 0) {
+        float want_f = 0;
+        double want_d = 0;
+        std::from_chars(buffer, end, want_f);
+        std::from_chars(buffer, end, want_d);
+        for (int mode : {FE_UPWARD, FE_DOWNWARD, FE_TOWARDZERO}) {
+          std::fesetround(mode);
+          float f = 0;
+          double d = 0;
+          const auto rf = chfloat::from_chars(buffer, end, f);
+          const auto rd = chfloat::from_chars(buffer, end, d);
+          CHECK(rf.ec == chfloat::errc::ok && bits(f) == bits(want_f));
+          CHECK(rd.ec == chfloat::errc::ok && bits(d) == bits(want_d));
+          comparisons += 2;
+        }
+        std::fesetround(FE_TONEAREST);
+      }
+    }
+  }
+#if (defined(_M_X64) || defined(__x86_64__)) && !defined(CHFLOAT_FORCE_PORTABLE)
+  const unsigned previous_csr = _mm_getcsr();
+  // Unmask the inexact exception. The parser must use its integer path and
+  // must not raise a floating-point exception for decimal 0.1.
+  _mm_setcsr(previous_csr & ~(0x1000u | 0x3fu));
+  const char text[] = "0.1";
+  double d = 0;
+  const auto result = chfloat::from_chars(text, text + 3, d);
+  const unsigned resulting_csr = _mm_getcsr();
+  _mm_setcsr(previous_csr);
+  CHECK(result.ec == chfloat::errc::ok && bits(d) == 0x3fb999999999999aULL);
+  CHECK((resulting_csr & 0x3fu) == 0);
+#endif
+  std::fesetround(original);
+}
+template <class T> void exact_midpoints() {
+  for (const auto& c : midpoint_cases) {
+    if (c.is_double != std::is_same<T, double>::value) continue;
+    for (bool negative : {false, true}) {
+      const std::string text = std::string(negative ? "-" : "") + c.text;
+      T value = T(123);
+      const auto r = chfloat::from_chars(text.data(), text.data() + text.size(), value);
+      const auto expected = c.expected | (negative ? std::uint64_t(1) << (sizeof(T) * 8 - 1) : 0);
+      CHECK(r.ptr == text.data() + text.size());
+      CHECK(r.ec == (c.range_error ? chfloat::errc::result_out_of_range : chfloat::errc::ok));
+      CHECK(bits(value) == (c.range_error ? bits(T(123)) : expected));
+      ++comparisons;
+    }
+  }
+}
+void arbitrary_buffers() {
+  std::mt19937_64 rng(984102);
+  for (unsigned i = 0; i < 5000; ++i) {
+    const std::size_t length = 1 + rng() % 48;
+    // An exact-sized allocation lets ASan detect reads past the supplied range.
+    char* raw = new char[length];
+    for (std::size_t j = 0; j < length; ++j) raw[j] = static_cast<char>(rng());
+    if (i % 2 == 0) raw[0] = '1';
+    for (auto fmt : {chfloat::chars_format::general, chfloat::chars_format::fixed,
+                     chfloat::chars_format::scientific, chfloat::chars_format::hex}) {
+      compare<float>({raw, length}, fmt);
+      compare<double>({raw, length}, fmt);
+    }
+    delete[] raw;
+  }
+}
 } // namespace
-
-int main() {
-  test_float_double_basic();
-  test_float_specials_if_supported();
-  test_float_errors();
-  test_ws_variant();
-  test_int_basic();
-  test_parse_digit();
-  return g_failures == 0 ? 0 : 1;
+int main(int argc, char** argv) {
+  std::size_t count = 50000;
+  if (argc == 2) count = std::strtoull(argv[1], nullptr, 10);
+  regression<float>(); regression<double>();
+  integer_tests<signed char>(); integer_tests<unsigned char>();
+  integer_tests<short>(); integer_tests<unsigned short>();
+  integer_tests<int>(); integer_tests<unsigned>();
+  integer_tests<long>(); integer_tests<unsigned long>();
+  integer_tests<long long>(); integer_tests<unsigned long long>();
+  random_decimal(count);
+  roundtrips<float>(count / 2); roundtrips<double>(count / 2);
+  rounding_modes();
+  short_decimal_rounding();
+  exact_midpoints<float>(); exact_midpoints<double>();
+  arbitrary_buffers();
+  for (unsigned i = 0; i < 256; ++i) {
+    unsigned value = 99;
+    const bool valid = chfloat::parse_digit(static_cast<char>(i), value);
+    CHECK(valid == (i >= '0' && i <= '9'));
+    CHECK(value == (valid ? i - '0' : 99));
+  }
+  std::printf("%llu comparisons, %d failures\n", (unsigned long long)comparisons, failures);
+  return failures ? 1 : 0;
 }

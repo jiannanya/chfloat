@@ -1,512 +1,357 @@
 #include <chfloat/chfloat.h>
-
-#include <chrono>
-#include <cstdio>
-#include <cstring>
+#ifdef CHFLOAT_HAS_REFERENCE
+#include <chfloat_reference/chfloat.h>
+#endif
 #include <algorithm>
-#include <array>
+#include <charconv>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <random>
-#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
-
 #if defined(_WIN32)
-  #define NOMINMAX
-  #include <windows.h>
+#ifndef NOMINMAX
+#define NOMINMAX
 #endif
-
+#include <windows.h>
+#endif
+#ifdef CHFLOAT_HAS_FAST_FLOAT
 #include <fast_float/fast_float.h>
+#endif
 
 namespace {
-
-using clock_type = std::chrono::steady_clock;
-
-struct bench_result {
-  std::string name;
-  double seconds = 0.0;
-  size_t items = 0;
-  double items_per_sec = 0.0;
-  double mb_per_sec = 0.0;
-};
-
-static double now_seconds() {
-  return std::chrono::duration<double>(clock_type::now().time_since_epoch()).count();
-}
-
-static void warm_cpu_seconds(double seconds) {
-  const double start = now_seconds();
-  // Busy loop to reduce cold-frequency / power-state ramp impacting the first timed run.
-  volatile std::uint64_t x = 0x123456789abcdef0ULL;
-  while ((now_seconds() - start) < seconds) {
-    x ^= (x << 7);
-    x ^= (x >> 9);
-    x *= 0x9e3779b97f4a7c15ULL;
-  }
-  if (x == 0) std::cerr << "";
-}
-
-static void setup_benchmark_process() {
+using Clock = std::chrono::steady_clock;
+volatile std::uint64_t sink = 0;
+std::uint64_t pin_benchmark_thread(int cpu) {
 #if defined(_WIN32)
-  // Best-effort: reduce scheduler jitter for single-threaded microbenchmarks.
-  // If these calls fail, benchmark still works.
-  (void)SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
-  (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-  // Pin to one CPU to avoid cross-core migration.
-  (void)SetThreadAffinityMask(GetCurrentThread(), 1ULL);
+  DWORD_PTR process_mask = 0, system_mask = 0;
+  if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask)) {
+    if (cpu >= int(sizeof(DWORD_PTR) * 8)) throw std::runtime_error("CPU index exceeds affinity mask width");
+    const DWORD_PTR first_cpu = cpu < 0 ? process_mask & (~process_mask + 1) : DWORD_PTR(1) << cpu;
+    if (!(first_cpu & process_mask)) throw std::runtime_error("requested CPU is unavailable");
+    if (SetThreadAffinityMask(GetCurrentThread(), first_cpu)) return first_cpu;
+  }
 #endif
-}
-
-static std::vector<std::string> make_random_decimal_strings(size_t n, uint32_t seed) {
-  std::mt19937 rng(seed);
-  std::uniform_int_distribution<int> sign_dist(0, 1);
-  std::uniform_int_distribution<int> int_digits_dist(1, 8);
-  std::uniform_int_distribution<int> frac_digits_dist(0, 8);
-  std::uniform_int_distribution<int> exp_dist(-30, 30);
-  std::uniform_int_distribution<int> digit_dist(0, 9);
-
-  std::vector<std::string> out;
-  out.reserve(n);
-
-  for (size_t i = 0; i < n; ++i) {
-    std::string s;
-    s.reserve(32);
-
-    if (sign_dist(rng)) s.push_back('-');
-
-    int int_digits = int_digits_dist(rng);
-    for (int d = 0; d < int_digits; ++d) {
-      char c = static_cast<char>('0' + digit_dist(rng));
-      // avoid leading zeros too often
-      if (d == 0 && c == '0') c = '1';
-      s.push_back(c);
-    }
-
-    int frac_digits = frac_digits_dist(rng);
-    if (frac_digits > 0) {
-      s.push_back('.');
-      for (int d = 0; d < frac_digits; ++d) {
-        s.push_back(static_cast<char>('0' + digit_dist(rng)));
-      }
-    }
-
-    int exp = exp_dist(rng);
-    if (exp != 0) {
-      s.push_back('e');
-      s += std::to_string(exp);
-    }
-
-    out.push_back(std::move(s));
-  }
-
-  return out;
-}
-
-static std::vector<std::string> make_random_decimal_strings_ex(size_t n, uint32_t seed, int int_digits_min,
-                                                               int int_digits_max, int frac_digits_min,
-                                                               int frac_digits_max, int exp_min, int exp_max,
-                                                               bool force_exp) {
-  std::mt19937 rng(seed);
-  std::uniform_int_distribution<int> sign_dist(0, 1);
-  std::uniform_int_distribution<int> int_digits_dist(int_digits_min, int_digits_max);
-  std::uniform_int_distribution<int> frac_digits_dist(frac_digits_min, frac_digits_max);
-  std::uniform_int_distribution<int> exp_dist(exp_min, exp_max);
-  std::uniform_int_distribution<int> digit_dist(0, 9);
-
-  std::vector<std::string> out;
-  out.reserve(n);
-
-  for (size_t i = 0; i < n; ++i) {
-    std::string s;
-    s.reserve(64);
-
-    if (sign_dist(rng)) s.push_back('-');
-
-    const int int_digits = int_digits_dist(rng);
-    for (int d = 0; d < int_digits; ++d) {
-      char c = static_cast<char>('0' + digit_dist(rng));
-      if (d == 0 && c == '0') c = '1';
-      s.push_back(c);
-    }
-
-    const int frac_digits = frac_digits_dist(rng);
-    if (frac_digits > 0) {
-      s.push_back('.');
-      for (int d = 0; d < frac_digits; ++d) {
-        s.push_back(static_cast<char>('0' + digit_dist(rng)));
-      }
-    }
-
-    const int exp = exp_dist(rng);
-    if (force_exp || exp != 0) {
-      s.push_back('e');
-      s += std::to_string(exp);
-    }
-
-    out.push_back(std::move(s));
-  }
-
-  return out;
-}
-
-static size_t total_bytes(const std::vector<std::string>& v) {
-  size_t b = 0;
-  for (auto& s : v) b += s.size();
-  return b;
-}
-
-template <class Fn>
-static bench_result run_bench(const std::string& name, const std::vector<std::string>& inputs, Fn&& fn, size_t iters) {
-  // Warmup
-  {
-    double sink = 0;
-    for (size_t i = 0; i < inputs.size(); ++i) {
-      sink += fn(inputs[i]);
-    }
-    if (sink == 1234567.0) std::cerr << "";
-  }
-
-  double start = now_seconds();
-  double sink = 0;
-  for (size_t it = 0; it < iters; ++it) {
-    for (size_t i = 0; i < inputs.size(); ++i) {
-      sink += fn(inputs[i]);
-    }
-  }
-  double end = now_seconds();
-  if (sink == 1234567.0) std::cerr << "";
-
-  const double sec = end - start;
-  const size_t items = inputs.size() * iters;
-  const double ips = (sec > 0) ? (static_cast<double>(items) / sec) : 0.0;
-  const double mbps = (sec > 0) ? (static_cast<double>(total_bytes(inputs) * iters) / (1024.0 * 1024.0) / sec) : 0.0;
-
-  bench_result r;
-  r.name = name;
-  r.seconds = sec;
-  r.items = items;
-  r.items_per_sec = ips;
-  r.mb_per_sec = mbps;
-  return r;
-}
-
-static std::string pad_right(std::string s, size_t n) {
-  if (s.size() < n) s.append(n - s.size(), ' ');
-  return s;
-}
-
-static std::string fmt_double(double v, int precision = 2) {
-  std::ostringstream oss;
-  oss.setf(std::ios::fixed);
-  oss << std::setprecision(precision) << v;
-  return oss.str();
-}
-
-static double median_inplace(std::vector<double>& v) {
-  if (v.empty()) return 0.0;
-  const size_t n = v.size();
-  const size_t mid = n / 2;
-  std::nth_element(v.begin(), v.begin() + mid, v.end());
-  double m = v[mid];
-  if ((n & 1) == 0) {
-    std::nth_element(v.begin(), v.begin() + (mid - 1), v.end());
-    m = 0.5 * (m + v[mid - 1]);
-  }
-  return m;
-}
-
-template <class Fn>
-static bench_result run_bench_stable(const std::string& name, const std::vector<std::string>& inputs, Fn&& fn,
-                                     size_t iters, size_t runs) {
-  std::vector<double> seconds;
-  seconds.reserve(runs);
-  for (size_t i = 0; i < runs; ++i) {
-    auto r = run_bench(name, inputs, fn, iters);
-    seconds.push_back(r.seconds);
-  }
-  const double med_sec = median_inplace(seconds);
-  const size_t items = inputs.size() * iters;
-  const double ips = (med_sec > 0) ? (static_cast<double>(items) / med_sec) : 0.0;
-  const double mbps = (med_sec > 0) ? (static_cast<double>(total_bytes(inputs) * iters) / (1024.0 * 1024.0) / med_sec)
-                                    : 0.0;
-
-  bench_result out;
-  out.name = name;
-  out.seconds = med_sec;
-  out.items = items;
-  out.items_per_sec = ips;
-  out.mb_per_sec = mbps;
-  return out;
-}
-
-static void write_markdown_table(std::ofstream& out, const std::vector<bench_result>& rows) {
-  // Determine column widths
-  size_t w_name = std::strlen("Name");
-  size_t w_sec = std::strlen("Seconds");
-  size_t w_ips = std::strlen("Items/s");
-  size_t w_mbps = std::strlen("MB/s");
-
-  std::vector<std::array<std::string, 4>> cells;
-  cells.reserve(rows.size());
-
-  for (auto& r : rows) {
-    std::array<std::string, 4> c = {
-        r.name,
-        fmt_double(r.seconds, 6),
-        fmt_double(r.items_per_sec, 0),
-        fmt_double(r.mb_per_sec, 2),
-    };
-    w_name = std::max(w_name, c[0].size());
-    w_sec = std::max(w_sec, c[1].size());
-    w_ips = std::max(w_ips, c[2].size());
-    w_mbps = std::max(w_mbps, c[3].size());
-    cells.push_back(std::move(c));
-  }
-
-  auto line = [&](const std::string& a, const std::string& b, const std::string& c, const std::string& d) {
-    out << "| " << pad_right(a, w_name) << " | " << pad_right(b, w_sec) << " | " << pad_right(c, w_ips)
-        << " | " << pad_right(d, w_mbps) << " |\n";
-  };
-
-  line("Name", "Seconds", "Items/s", "MB/s");
-  line(std::string(w_name, '-'), std::string(w_sec, '-'), std::string(w_ips, '-'), std::string(w_mbps, '-'));
-  for (auto& c : cells) {
-    line(c[0], c[1], c[2], c[3]);
-  }
-}
-
-struct scenario_report {
-  std::string name;
-  size_t n = 0;
-  size_t iters = 0;
-  std::vector<bench_result> one_shot;
-  std::vector<bench_result> stable;
-};
-
-static void write_markdown_report(const std::string& path, const std::vector<scenario_report>& scenarios,
-                                  size_t stable_runs) {
-  std::filesystem::path p(path);
-  if (p.has_parent_path()) {
-    std::error_code ec;
-    std::filesystem::create_directories(p.parent_path(), ec);
-  }
-
-  std::ofstream out(path, std::ios::binary);
-  out << "# chfloat benchmark report\n\n";
-  out << "Environment:\n\n";
-  out << "- C++: C++17\n";
-  out << "- Build: "
-#if defined(NDEBUG)
-         "Release"
-#else
-         "Debug"
-#endif
-      << "\n";
-
-#if defined(_MSC_VER)
-  out << "- Compiler: MSVC _MSC_VER=" << _MSC_VER << "\n";
-#elif defined(__clang__)
-  out << "- Compiler: Clang " << __clang_major__ << "." << __clang_minor__ << "." << __clang_patchlevel__ << "\n";
-#elif defined(__GNUC__)
-  out << "- Compiler: GCC " << __GNUC__ << "." << __GNUC_MINOR__ << "." << __GNUC_PATCHLEVEL__ << "\n";
-#else
-  out << "- Compiler: (unknown)\n";
-#endif
-  out << "- Baselines: chfloat + std::strtod/strtof\n";
-  out << "- Comparison: fast_float\n";
-  out << "\n";
-
-  for (const auto& sc : scenarios) {
-    out << "## Scenario: " << sc.name << "\n\n";
-    out << "- Inputs: n=" << sc.n << ", iters=" << sc.iters << "\n\n";
-
-    out << "### One-shot\n\n";
-    write_markdown_table(out, sc.one_shot);
-
-    out << "\n\n### Stable (median)\n\n";
-    out << "- Runs: " << stable_runs << " (median seconds)\n\n";
-    write_markdown_table(out, sc.stable);
-    out << "\n\n";
-  }
-
-  out << "\nNotes:\n\n";
-  out << "- Items/s counts parsed numbers; MB/s counts input bytes processed.\n";
-  out << "- This benchmark is single-threaded and measures throughput on this machine.\n";
-  out << "- The 'Stable' table reports median seconds across multiple runs.\n";
-}
-
-} // namespace
-
-int main(int argc, char** argv) {
-  setup_benchmark_process();
-
-  size_t n = 1'000'00;      // number of distinct strings
-  size_t iters = 10;        // repeat count
-  uint32_t seed = 12345;
-  size_t stable_runs = 7;
-
-  for (int i = 1; i < argc; ++i) {
-    if (std::strcmp(argv[i], "--n") == 0 && i + 1 < argc) {
-      n = static_cast<size_t>(std::stoull(argv[++i]));
-    } else if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
-      iters = static_cast<size_t>(std::stoull(argv[++i]));
-    } else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
-      seed = static_cast<uint32_t>(std::stoul(argv[++i]));
-    } else if (std::strcmp(argv[i], "--stable-runs") == 0 && i + 1 < argc) {
-      stable_runs = static_cast<size_t>(std::stoull(argv[++i]));
-    }
-  }
-
-  struct scenario_def {
-    const char* name;
-    int int_min, int_max;
-    int frac_min, frac_max;
-    int exp_min, exp_max;
-    bool force_exp;
-    uint32_t seed_salt;
-  };
-
-  // Keep exponent within [-30, 30] so float and double both stay mostly in-range.
-  const scenario_def defs[] = {
-      {"mixed", 1, 8, 0, 8, -30, 30, false, 0x11111111u},
-      {"short_no_exp", 1, 6, 0, 2, 0, 0, false, 0x22222222u},
-      {"long_frac", 1, 16, 0, 16, -30, 30, true, 0x33333333u},
-  };
-
-  std::vector<scenario_report> reports;
-  reports.reserve(std::size(defs));
-
-  for (const auto& def : defs) {
-    scenario_report sc;
-    sc.name = def.name;
-    sc.n = n;
-    sc.iters = iters;
-
-    auto inputs = make_random_decimal_strings_ex(n, seed ^ def.seed_salt, def.int_min, def.int_max, def.frac_min,
-                                                def.frac_max, def.exp_min, def.exp_max, def.force_exp);
-
-    // Warm CPU to reduce first-timed-run volatility.
-    warm_cpu_seconds(0.15);
-
-    sc.one_shot.push_back(run_bench("chfloat::from_chars<double>", inputs,
-                                   [](const std::string& s) {
-                                     double v = 0;
-                                     auto r = chfloat::from_chars(s.data(), s.data() + s.size(), v);
-                                     return (r.ec == chfloat::errc::ok) ? v : 0.0;
-                                   },
-                                   iters));
-    sc.stable.push_back(run_bench_stable("chfloat::from_chars<double>", inputs,
-                                        [](const std::string& s) {
-                                          double v = 0;
-                                          auto r = chfloat::from_chars(s.data(), s.data() + s.size(), v);
-                                          return (r.ec == chfloat::errc::ok) ? v : 0.0;
-                                        },
-                                        iters, stable_runs));
-
-    sc.one_shot.push_back(run_bench("fast_float::from_chars<double>", inputs,
-                                   [](const std::string& s) {
-                                     double v = 0;
-                                     auto r = fast_float::from_chars(s.data(), s.data() + s.size(), v);
-                                     return (r.ec == std::errc{}) ? v : 0.0;
-                                   },
-                                   iters));
-    sc.stable.push_back(run_bench_stable("fast_float::from_chars<double>", inputs,
-                                        [](const std::string& s) {
-                                          double v = 0;
-                                          auto r = fast_float::from_chars(s.data(), s.data() + s.size(), v);
-                                          return (r.ec == std::errc{}) ? v : 0.0;
-                                        },
-                                        iters, stable_runs));
-
-    sc.one_shot.push_back(run_bench("std::strtod", inputs,
-                                   [](const std::string& s) {
-                                     char* end = nullptr;
-                                     double v = std::strtod(s.c_str(), &end);
-                                     return (end != s.c_str()) ? v : 0.0;
-                                   },
-                                   iters));
-    sc.stable.push_back(run_bench_stable("std::strtod", inputs,
-                                        [](const std::string& s) {
-                                          char* end = nullptr;
-                                          double v = std::strtod(s.c_str(), &end);
-                                          return (end != s.c_str()) ? v : 0.0;
-                                        },
-                                        iters, stable_runs));
-
-    sc.one_shot.push_back(run_bench("chfloat::from_chars<float>", inputs,
-                                   [](const std::string& s) {
-                                     float v = 0;
-                                     auto r = chfloat::from_chars(s.data(), s.data() + s.size(), v);
-                                     return (r.ec == chfloat::errc::ok) ? static_cast<double>(v) : 0.0;
-                                   },
-                                   iters));
-    sc.stable.push_back(run_bench_stable("chfloat::from_chars<float>", inputs,
-                                        [](const std::string& s) {
-                                          float v = 0;
-                                          auto r = chfloat::from_chars(s.data(), s.data() + s.size(), v);
-                                          return (r.ec == chfloat::errc::ok) ? static_cast<double>(v) : 0.0;
-                                        },
-                                        iters, stable_runs));
-
-    sc.one_shot.push_back(run_bench("fast_float::from_chars<float>", inputs,
-                                   [](const std::string& s) {
-                                     float v = 0;
-                                     auto r = fast_float::from_chars(s.data(), s.data() + s.size(), v);
-                                     return (r.ec == std::errc{}) ? static_cast<double>(v) : 0.0;
-                                   },
-                                   iters));
-    sc.stable.push_back(run_bench_stable("fast_float::from_chars<float>", inputs,
-                                        [](const std::string& s) {
-                                          float v = 0;
-                                          auto r = fast_float::from_chars(s.data(), s.data() + s.size(), v);
-                                          return (r.ec == std::errc{}) ? static_cast<double>(v) : 0.0;
-                                        },
-                                        iters, stable_runs));
-
-    sc.one_shot.push_back(run_bench("std::strtof", inputs,
-                                   [](const std::string& s) {
-                                     char* end = nullptr;
-                                     float v = std::strtof(s.c_str(), &end);
-                                     return (end != s.c_str()) ? static_cast<double>(v) : 0.0;
-                                   },
-                                   iters));
-    sc.stable.push_back(run_bench_stable("std::strtof", inputs,
-                                        [](const std::string& s) {
-                                          char* end = nullptr;
-                                          float v = std::strtof(s.c_str(), &end);
-                                          return (end != s.c_str()) ? static_cast<double>(v) : 0.0;
-                                        },
-                                        iters, stable_runs));
-
-    reports.push_back(std::move(sc));
-  }
-
-  // Write report
-  std::string report_path;
-#if defined(CHFLOAT_PROJECT_DIR)
-  report_path = (std::filesystem::path(CHFLOAT_PROJECT_DIR) / "report" / "benchmark.md").string();
-#else
-  report_path = std::string("report/benchmark.md");
-#endif
-  write_markdown_report(report_path, reports, stable_runs);
-
-  // Also print a short summary to stdout.
-  std::cout << "Wrote " << report_path << "\n";
-  for (const auto& sc : reports) {
-    std::cout << "Scenario: " << sc.name << "\n";
-    std::cout << "One-shot:\n";
-    for (const auto& r : sc.one_shot) {
-      std::cout << r.name << ": " << r.items_per_sec << " items/s, " << r.mb_per_sec << " MB/s\n";
-    }
-    std::cout << "Stable (median, runs=" << stable_runs << "):\n";
-    for (const auto& r : sc.stable) {
-      std::cout << r.name << ": " << r.items_per_sec << " items/s, " << r.mb_per_sec << " MB/s\n";
-    }
-  }
-
+  if (cpu >= 0) throw std::runtime_error("could not pin the requested CPU (Windows only)");
   return 0;
+}
+struct dataset {
+  std::vector<char> bytes;
+  std::vector<std::size_t> offsets;
+  std::size_t payload = 0;
+  void append(std::string_view text) {
+    offsets.push_back(bytes.size());
+    bytes.insert(bytes.end(), text.begin(), text.end());
+    bytes.push_back('\0');
+    payload += text.size();
+  }
+  std::string_view at(std::size_t i) const {
+    const auto end = i + 1 < offsets.size() ? offsets[i + 1] : bytes.size();
+    return {bytes.data() + offsets[i], end - offsets[i] - 1};
+  }
+  std::size_t storage() const { return bytes.capacity() + offsets.capacity() * sizeof(std::size_t); }
+};
+struct result { std::uint64_t bits; std::size_t consumed; int ec; };
+template <class T> result pack(T value, const char* end, std::string_view s, int ec) {
+  std::uint64_t bits = 0;
+  if (!ec) std::memcpy(&bits, &value, sizeof(T));
+  return {bits, std::size_t(end - s.data()), ec};
+}
+int error_code(std::errc ec) {
+  return ec == std::errc{} ? 0 : ec == std::errc::invalid_argument ? 1 : 2;
+}
+template <class T> result parse_ch(std::string_view s, int base) {
+  T v = 0;
+  if constexpr (std::is_integral<T>::value) {
+    auto r = chfloat::from_chars(s.data(), s.data() + s.size(), v, base);
+    return pack(v, r.ptr, s, int(r.ec));
+  } else {
+    auto r = chfloat::from_chars(s.data(), s.data() + s.size(), v);
+    return pack(v, r.ptr, s, int(r.ec));
+  }
+}
+template <class T> result parse_std(std::string_view s, int base) {
+  T v = 0;
+  if constexpr (std::is_integral<T>::value) {
+    auto r = std::from_chars(s.data(), s.data() + s.size(), v, base);
+    return pack(v, r.ptr, s, error_code(r.ec));
+  } else {
+    auto r = std::from_chars(s.data(), s.data() + s.size(), v);
+    return pack(v, r.ptr, s, error_code(r.ec));
+  }
+}
+#ifdef CHFLOAT_HAS_REFERENCE
+template <class T> result parse_reference(std::string_view s, int base) {
+  T v = 0;
+  if constexpr (std::is_integral<T>::value) {
+    const auto r = chfloat_reference::from_chars(s.data(), s.data() + s.size(), v, base);
+    return pack(v, r.ptr, s, int(r.ec));
+  } else {
+    const auto r = chfloat_reference::from_chars(s.data(), s.data() + s.size(), v);
+    return pack(v, r.ptr, s, int(r.ec));
+  }
+}
+#endif
+template <class T> result parse_c(std::string_view s, int) {
+  char* end = nullptr;
+  T value;
+  if constexpr (std::is_same<T, float>::value) value = std::strtof(s.data(), &end);
+  else value = std::strtod(s.data(), &end);
+  int ec = end == s.data() ? 1 : !std::isfinite(value) ? 2 : 0;
+  if (!ec && value == 0) {
+    // Generated datasets always have a nonzero leading digit.
+    ec = 2;
+  }
+  return pack(value, end, s, ec);
+}
+struct row {
+  std::string name;
+  double median, minimum, maximum;
+  std::size_t mismatches;
+  double paired_speedup = 0;
+};
+using parser = result (*)(std::string_view, int);
+// Keep one identical timing loop for all parsers. Separate inlined loops can
+// acquire different register allocation/layout even for identical headers.
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) && !defined(__clang__)
+__attribute__((noinline, noclone))
+#elif defined(__clang__)
+__attribute__((noinline))
+#endif
+double timed(const dataset& data, std::size_t iters, int base, parser fn) {
+  std::uint64_t checksum = 0;
+  const auto start = Clock::now();
+  for (std::size_t it = 0; it < iters; ++it) {
+    for (std::size_t i = 0; i < data.offsets.size(); ++i) {
+      const auto r = fn(data.at(i), base);
+      checksum += r.bits ^ (r.consumed + unsigned(r.ec));
+    }
+  }
+  const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
+  sink = checksum;
+  return seconds;
+}
+row measure(const std::string& name, const dataset& data, const std::vector<result>& reference,
+            std::size_t iters, std::size_t runs, int base, parser fn) {
+  std::size_t mismatches = 0;
+  for (std::size_t i = 0; i < reference.size(); ++i) {
+    const auto r = fn(data.at(i), base);
+    const auto want = reference[i];
+    mismatches += r.ec != want.ec || r.consumed != want.consumed || r.bits != want.bits;
+  }
+  timed(data, 1, base, fn);
+  std::vector<double> times;
+  times.reserve(runs);
+  for (std::size_t run = 0; run < runs; ++run) times.push_back(timed(data, iters, base, fn));
+  std::sort(times.begin(), times.end());
+  const auto mid = runs / 2;
+  const auto med = runs % 2 ? times[mid] : (times[mid - 1] + times[mid]) / 2;
+  return {name, med, times.front(), times.back(), mismatches};
+}
+#ifdef CHFLOAT_HAS_REFERENCE
+void measure_pair(std::vector<row>& rows, const std::string& type, const dataset& data,
+    const std::vector<result>& oracle, std::size_t iters, std::size_t runs, int base, parser fn, parser reference) {
+  std::size_t errors = 0, reference_errors = 0;
+  for (std::size_t i = 0; i < oracle.size(); ++i) {
+    const auto want = oracle[i], current = fn(data.at(i), base), previous = reference(data.at(i), base);
+    errors += current.ec != want.ec || current.consumed != want.consumed || current.bits != want.bits;
+    reference_errors += previous.ec != want.ec || previous.consumed != want.consumed || previous.bits != want.bits;
+  }
+  timed(data, 1, base, fn);
+  timed(data, 1, base, reference);
+  std::vector<double> now(runs), before(runs), ratios(runs);
+  for (std::size_t run = 0; run < runs; ++run) {
+    if (run % 2) { before[run] = timed(data, iters, base, reference); now[run] = timed(data, iters, base, fn); }
+    else { now[run] = timed(data, iters, base, fn); before[run] = timed(data, iters, base, reference); }
+    ratios[run] = before[run] / now[run];
+  }
+  auto median = [](std::vector<double>& v) {
+    std::sort(v.begin(), v.end());
+    return v.size() % 2 ? v[v.size() / 2] : (v[v.size() / 2 - 1] + v[v.size() / 2]) / 2;
+  };
+  const auto current_median = median(now), reference_median = median(before), speedup = median(ratios);
+  rows.push_back({"chfloat<" + type + ">", current_median, now.front(), now.back(), errors, speedup});
+  rows.push_back({"reference_chfloat<" + type + ">", reference_median, before.front(), before.back(), reference_errors});
+}
+#endif
+struct options {
+  std::size_t n = 100000, iters = 10, runs = 7;
+  std::uint64_t seed = 12345;
+  int cpu = -1;
+  std::string report = "report/benchmark.md", scenario;
+};
+struct scenario { const char* name; int int_max, frac_max, exp_min, exp_max, base; };
+dataset generate(const scenario& sc, const options& opt) {
+  std::mt19937_64 rng(opt.seed);
+  dataset data;
+  data.offsets.reserve(opt.n);
+  data.bytes.reserve(opt.n * std::size_t(sc.int_max + sc.frac_max + 16));
+  for (std::size_t i = 0; i < opt.n; ++i) {
+    std::string s;
+    if (sc.base) {
+      const auto value = static_cast<long long>(rng() & 0x7fffffffffffffffULL);
+      char buffer[80];
+      const auto r = std::to_chars(buffer, buffer + sizeof(buffer), (rng() & 1) ? -value : value, sc.base);
+      s.assign(buffer, r.ptr);
+    } else {
+      if (rng() & 1) s += '-';
+      const int ints = 1 + int(rng() % unsigned(sc.int_max));
+      const int fracs = int(rng() % unsigned(sc.frac_max + 1));
+      for (int j = 0; j < ints; ++j) s += char('0' + (j ? rng() % 10 : 1 + rng() % 9));
+      if (fracs) {
+        s += '.';
+        for (int j = 0; j < fracs; ++j) s += char('0' + rng() % 10);
+      }
+      const int exponent = sc.exp_min + int(rng() % unsigned(sc.exp_max - sc.exp_min + 1));
+      if (exponent) { s += 'e'; s += std::to_string(exponent); }
+    }
+    data.append(s);
+  }
+  // Storage is reported explicitly, including capacity, with no per-number allocation.
+  data.bytes.shrink_to_fit();
+  return data;
+}
+template <class T> void benchmark_type(std::vector<row>& rows, const char* type, const dataset& data, const scenario& sc, const options& opt) {
+  std::vector<result> reference;
+  reference.reserve(data.offsets.size());
+  for (std::size_t i = 0; i < data.offsets.size(); ++i) reference.push_back(parse_std<T>(data.at(i), sc.base));
+#ifdef CHFLOAT_HAS_REFERENCE
+  measure_pair(rows, type, data, reference, opt.iters, opt.runs, sc.base, parse_ch<T>, parse_reference<T>);
+#else
+  rows.push_back(measure(std::string("chfloat<") + type + ">", data, reference, opt.iters, opt.runs, sc.base, parse_ch<T>));
+#endif
+  rows.push_back(measure(std::string("std::from_chars<") + type + ">", data, reference, opt.iters, opt.runs, sc.base, parse_std<T>));
+  if constexpr (std::is_floating_point<T>::value) {
+    rows.push_back(measure(std::is_same<T, float>::value ? "std::strtof" : "std::strtod", data, reference, opt.iters, opt.runs, sc.base, parse_c<T>));
+#ifdef CHFLOAT_HAS_FAST_FLOAT
+    rows.push_back(measure(std::string("fast_float<") + type + ">", data, reference, opt.iters, opt.runs, sc.base, [](std::string_view s, int) {
+      T value = 0;
+      const auto r = fast_float::from_chars(s.data(), s.data() + s.size(), value);
+      return pack(value, r.ptr, s, error_code(r.ec));
+    }));
+#endif
+  }
+}
+std::uint64_t number(std::string_view s) {
+  std::uint64_t value = 0;
+  const auto r = std::from_chars(s.data(), s.data() + s.size(), value);
+  if (r.ec != std::errc{} || r.ptr != s.data() + s.size()) throw std::runtime_error("invalid numeric option");
+  return value;
+}
+} // namespace
+int main(int argc, char** argv) try {
+  options opt;
+  for (int i = 1; i < argc; ++i) {
+    const std::string_view key = argv[i];
+    if (key == "--help") {
+      std::cout << "Usage: chfloat_benchmark [--n N] [--iters N] [--runs N] [--seed N] [--cpu N (Windows)] [--scenario NAME] [--report PATH]\n";
+      return 0;
+    }
+    if (++i == argc) throw std::runtime_error("missing option value");
+    const std::string_view value = argv[i];
+    if (key == "--n") opt.n = static_cast<std::size_t>(number(value));
+    else if (key == "--iters") opt.iters = static_cast<std::size_t>(number(value));
+    else if (key == "--runs" || key == "--stable-runs") opt.runs = static_cast<std::size_t>(number(value));
+    else if (key == "--seed") opt.seed = number(value);
+    else if (key == "--cpu") {
+      const auto cpu = number(value);
+      if (cpu >= 64) throw std::runtime_error("CPU index must be below 64");
+      opt.cpu = static_cast<int>(cpu);
+    }
+    else if (key == "--report") opt.report = value;
+    else if (key == "--scenario") opt.scenario = value;
+    else throw std::runtime_error("unknown option: " + std::string(key));
+  }
+  if (!opt.n || !opt.iters || !opt.runs) throw std::runtime_error("n, iters and runs must be positive");
+  if (opt.n > (std::numeric_limits<std::size_t>::max)() / 128 || opt.iters > (std::numeric_limits<std::size_t>::max)() / opt.n)
+    throw std::runtime_error("requested workload is too large");
+  const scenario scenarios[] = {
+    {"mixed", 8, 8, -30, 30, 0}, {"short_no_exp", 6, 2, 0, 0, 0}, {"long_frac", 16, 32, -30, 30, 0},
+    {"wide_range", 19, 60, -350, 310, 0}, {"integer_decimal", 20, 0, 0, 0, 10}, {"integer_hex", 16, 0, 0, 0, 16}
+  };
+  bool selected = opt.scenario.empty();
+  for (const auto& sc : scenarios) selected |= opt.scenario == sc.name;
+  if (!selected) throw std::runtime_error("unknown scenario: " + opt.scenario);
+  const auto affinity = pin_benchmark_thread(opt.cpu);
+  const std::filesystem::path path(opt.report);
+  if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
+  std::ofstream report(path);
+  if (!report) throw std::runtime_error("cannot open report: " + opt.report);
+  report << "# chfloat benchmark report\n\n";
+#ifdef CHFLOAT_BASELINE
+  report << "Implementation: baseline snapshot (same benchmark harness).\n\n";
+#else
+  report << "Implementation: current headers.\n\n";
+#endif
+#ifdef CHFLOAT_COMPACT
+  report << "Cached powers: compact (5,208 bytes).\n\n";
+#else
+  report << "Cached powers: full (10,416 bytes).\n\n";
+#endif
+  report << "Thread affinity mask: " << affinity << " (0 means not pinned).\n\n";
+#ifdef CHFLOAT_HAS_REFERENCE
+  report << "Current/reference timings alternate within each run; paired speedup is the median of reference/current time ratios.\n\n";
+  report << "Reference float_parse.h SHA-256: `" << CHFLOAT_REFERENCE_HASH << "`.\n\n";
+#endif
+#if defined(__clang__)
+  report << "Compiler: Clang " << __clang_version__ << "\n\n";
+#elif defined(_MSC_VER)
+  report << "Compiler: MSVC " << _MSC_VER << "\n\n";
+#else
+  report << "Compiler: " << __VERSION__ << "\n\n";
+#endif
+#ifdef NDEBUG
+  report << "Build: Release; ";
+#else
+  report << "Build: Debug; ";
+#endif
+  report << "C++17; seed=" << opt.seed << "; n=" << opt.n << "; iters=" << opt.iters << "; runs=" << opt.runs << ".\n\n"
+         << "Each parser is checked against std::from_chars before timing. Mismatches include value bits, error codes and consumed length. "
+         << "Error outputs are normalized. All parsers use one non-inlined timing loop with the same function-pointer call boundary. "
+         << "Timings include indirect calls and result consumption; each run has identical packed input. "
+         << "Heap storage below is dataset capacity, excluding reference results and process/runtime overhead.\n\n";
+  bool correct = true;
+  for (const auto& sc : scenarios) {
+    if (!opt.scenario.empty() && opt.scenario != sc.name) continue;
+    const auto data = generate(sc, opt);
+    std::vector<row> rows;
+    if (sc.base) benchmark_type<long long>(rows, "int64", data, sc, opt);
+    else { benchmark_type<double>(rows, "double", data, sc, opt); benchmark_type<float>(rows, "float", data, sc, opt); }
+    report << "## " << sc.name << "\n\nInput bytes: " << data.payload << "; dataset allocated bytes: " << data.storage() << ".\n\n"
+           << "| Parser | Median s | Min s | Max s | M items/s | MiB/s | Mismatches | Paired speedup |\n"
+           << "|---|---:|---:|---:|---:|---:|---:|---:|\n";
+    for (const auto& r : rows) {
+      if (r.name.compare(0, 8, "chfloat<") == 0) correct &= r.mismatches == 0;
+      const double rate = double(opt.n) * double(opt.iters) / r.median / 1e6;
+      report << "| " << r.name << " | " << std::fixed << std::setprecision(6) << r.median << " | " << r.minimum << " | " << r.maximum
+             << " | " << std::setprecision(3) << rate << " | " << double(data.payload) * double(opt.iters) / r.median / 1048576
+             << " | " << r.mismatches << " | ";
+      if (r.paired_speedup) report << r.paired_speedup << "x";
+      else report << "-";
+      report << " |\n";
+      std::cout << sc.name << ": " << r.name << " " << rate << " M items/s; mismatches=" << r.mismatches << '\n';
+      if (r.paired_speedup) std::cout << "  paired speedup: " << r.paired_speedup << "x\n";
+    }
+    report << '\n';
+  }
+  report << "Throughput is specific to this workload, compiler and machine.\n";
+  report.flush();
+  if (!report) throw std::runtime_error("failed writing report: " + opt.report);
+  std::cout << "Wrote " << opt.report << '\n';
+  return correct ? 0 : 2;
+} catch (const std::exception& e) {
+  std::cerr << "Benchmark error: " << e.what() << '\n';
+  return 1;
 }
