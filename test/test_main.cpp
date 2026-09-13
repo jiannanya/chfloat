@@ -272,6 +272,76 @@ void arbitrary_buffers() {
     delete[] raw;
   }
 }
+void long_run_boundaries() {
+  for (std::size_t n : {0u, 1u, 7u, 8u, 9u, 15u, 16u, 17u, 18u, 19u, 20u, 31u, 32u, 33u,
+                        63u, 64u, 65u, 255u, 256u, 257u, 4096u}) {
+    for (auto text : {std::string(n, '0') + "123.25!", "0." + std::string(n, '0') + "125e" + std::to_string(n),
+                      "1.25e+" + std::string(n, '0') + "2!", "1.25e-" + std::string(n, '0') + "2!",
+                      "1e" + std::string(n, '0') + "!", "1e-" + std::string(n, '9') + "!"}) {
+      compare<float>(text); compare<double>(text);
+    }
+    // Exercise every possible terminating byte at each block boundary, with
+    // exact-sized buffers so sanitizers can catch speculative overreads.
+    for (unsigned c = 0; c < 256; ++c) {
+      const std::string prefix = "99999999999999999999" + std::string(n, '9');
+      const auto size = prefix.size() + 1;
+      char* text = new char[size];
+      std::memcpy(text, prefix.data(), prefix.size());
+      text[size - 1] = static_cast<char>(c);
+      long long value = 123, expected = 123;
+      const auto want = std::from_chars(text, text + size, expected);
+      const auto got = chfloat::from_chars(text, text + size, value);
+      CHECK(want.ec == std::errc::result_out_of_range && got.ec == chfloat::errc::result_out_of_range);
+      CHECK(got.ptr == want.ptr && value == 123);
+      ++comparisons;
+      delete[] text;
+    }
+  }
+  for (unsigned bit = 0; bit < 64; ++bit) {
+    const auto v = std::uint64_t(1) << bit;
+    CHECK(chfloat::detail::lz64(v) == int(63 - bit));
+    CHECK(chfloat::detail::lz64(v | (v - 1)) == int(63 - bit));
+  }
+  CHECK(chfloat::detail::lz64(0) == 64);
+}
+template <class T> void compare_integer_buffer(std::string_view s) {
+  const char* first = s.data();
+  const char* last = first + s.size();
+  const char* oracle = first;
+  if constexpr (std::is_signed<T>::value) {
+    if (first != last && *first == '+') ++oracle;
+  }
+  T expected = 123, value = 123;
+  auto want = std::from_chars(oracle, last, expected);
+  if (oracle != first && oracle != last && (*oracle == '+' || *oracle == '-')) want.ec = std::errc::invalid_argument;
+  if (want.ec == std::errc::invalid_argument) want.ptr = first;
+  const auto got = chfloat::from_chars(first, last, value);
+  const auto ec = want.ec == std::errc{} ? chfloat::errc::ok :
+      want.ec == std::errc::invalid_argument ? chfloat::errc::invalid_argument : chfloat::errc::result_out_of_range;
+  CHECK(got.ec == ec && got.ptr == want.ptr && value == (want.ec == std::errc{} ? expected : T(123)));
+  ++comparisons;
+}
+void integer_byte_boundaries() {
+  // Cover every byte value throughout bounded integer inputs, including
+  // digits around 32/64-bit limits and signs with no following digit.
+  constexpr char number[] = "1844674407370955161500";
+  for (std::size_t length : {1u, 7u, 8u, 9u, 15u, 16u, 17u, 19u, 20u, 21u}) {
+    char* raw = new char[length];
+    std::memcpy(raw, number, length);
+    for (std::size_t pos = 0; pos < length; ++pos) {
+      for (unsigned c = 0; c < 256; ++c) {
+        raw[pos] = static_cast<char>(c);
+        const std::string_view text(raw, length);
+        compare_integer_buffer<std::int32_t>(text);
+        compare_integer_buffer<std::uint32_t>(text);
+        compare_integer_buffer<std::int64_t>(text);
+        compare_integer_buffer<std::uint64_t>(text);
+      }
+      raw[pos] = number[pos];
+    }
+    delete[] raw;
+  }
+}
 } // namespace
 int main(int argc, char** argv) {
   std::size_t count = 50000;
@@ -288,6 +358,8 @@ int main(int argc, char** argv) {
   short_decimal_rounding();
   exact_midpoints<float>(); exact_midpoints<double>();
   arbitrary_buffers();
+  long_run_boundaries();
+  integer_byte_boundaries();
   for (unsigned i = 0; i < 256; ++i) {
     unsigned value = 99;
     const bool valid = chfloat::parse_digit(static_cast<char>(i), value);

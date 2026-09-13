@@ -43,7 +43,12 @@ inline int lz64(u64 x) noexcept {
 #else
   if (!x) return 64;
   int n = 0;
-  while (!(x & (u64(1) << 63))) { ++n; x <<= 1; }
+  if (!(x >> 32)) { n += 32; x <<= 32; }
+  if (!(x >> 48)) { n += 16; x <<= 16; }
+  if (!(x >> 56)) { n += 8; x <<= 8; }
+  if (!(x >> 60)) { n += 4; x <<= 4; }
+  if (!(x >> 62)) { n += 2; x <<= 2; }
+  n += int(!(x >> 63));
   return n;
 #endif
 }
@@ -87,6 +92,16 @@ inline u32 parse_8_digits(u64 v) noexcept {
 }
 inline unsigned digit(char c) noexcept { return unsigned(static_cast<unsigned char>(c)) - '0'; }
 inline bool is_digit(char c) noexcept { return digit(c) < 10; }
+inline const char* skip_zeroes(const char* p, const char* last) noexcept {
+  while (last - p >= 8 && load_u64_unaligned(p) == 0x3030303030303030ULL) p += 8;
+  while (p != last && *p == '0') ++p;
+  return p;
+}
+inline const char* skip_decimal_digits(const char* p, const char* last) noexcept {
+  while (last - p >= 8 && all_8_digits(load_u64_unaligned(p))) p += 8;
+  while (p != last && is_digit(*p)) ++p;
+  return p;
+}
 inline i64 saturated_add(i64 a, i64 b) noexcept {
   constexpr i64 hi = (std::numeric_limits<i64>::max)(), lo = (std::numeric_limits<i64>::min)();
   if (b > 0 && a > hi - b) return hi;
@@ -97,6 +112,10 @@ inline const char* read_exponent(const char* p, const char* last, i64& exponent)
   bool neg = false;
   if (p != last && (*p == '+' || *p == '-')) { neg = *p == '-'; ++p; }
   if (p == last || !is_digit(*p)) return nullptr;
+  if (*p == '0') {
+    p = skip_zeroes(p, last);
+    if (p == last || !is_digit(*p)) return p;
+  }
   constexpr i64 cap = (std::numeric_limits<i64>::max)();
   // The first two digits cannot overflow, and cover common scientific input.
   i64 value = digit(*p++);
@@ -104,8 +123,12 @@ inline const char* read_exponent(const char* p, const char* last, i64& exponent)
     value = value * 10 + digit(*p++);
     while (p != last && is_digit(*p)) {
       const unsigned d = digit(*p++);
-      value = value < cap / 10 || (value == cap / 10 && d <= unsigned(cap % 10))
-                  ? value * 10 + d : cap;
+      if (value > cap / 10 || (value == cap / 10 && d > unsigned(cap % 10))) {
+        value = cap;
+        p = skip_decimal_digits(p, last);
+        break;
+      }
+      value = value * 10 + d;
     }
   }
   exponent = saturated_add(exponent, neg ? -value : value);
@@ -136,7 +159,7 @@ CHFLOAT_FORCEINLINE decimal scan_decimal(const char* p, const char* last, unsign
   decimal d{};
   const char* integer = p;
   // Leading zeroes never consume the significant-digit budget.
-  while (p != last && *p == '0') ++p;
+  if (p != last && *p == '0') p = skip_zeroes(p, last);
   if (last - p <= 19) {
     // The bounded range cannot overflow the significand; omit per-digit budget
     // checks and tail scanning for short numbers.
@@ -147,7 +170,7 @@ CHFLOAT_FORCEINLINE decimal scan_decimal(const char* p, const char* last, unsign
     if (p != last && *p == '.') {
       const char* fraction = ++p;
       if (!d.mant) {
-        while (p != last && *p == '0') ++p;
+        p = skip_zeroes(p, last);
       }
       const char* significant_fraction = p;
       while (p != last && is_digit(*p)) d.mant = d.mant * 10 + digit(*p++);
@@ -180,7 +203,7 @@ CHFLOAT_FORCEINLINE decimal scan_decimal(const char* p, const char* last, unsign
     const char* fraction = ++p;
     if (d.mant == 0) {
       const char* zeroes = p;
-      while (p != last && *p == '0') ++p;
+      p = skip_zeroes(p, last);
       d.exp10 -= p - zeroes;
     }
     while (last - p >= 8 && d.digits <= 11) {
@@ -276,10 +299,13 @@ CHFLOAT_FORCEINLINE binary compute_binary(int q, u64 w, bool truncated = false) 
   const int upper = int(p.hi >> 63);
   const int shift = upper + 64 - B::fraction - 3;
   u64 m = p.hi >> shift;
-  // Floor division is explicit: right-shifting negative signed integers is
-  // implementation-defined in C++17.
+  // Bias the bounded product into the unsigned range before shifting. The
+  // bias is an exact multiple of 65536, so this is floor division for both
+  // signs without a signed right shift or a sign-dependent branch.
+  static_assert(217706LL * pow5_smallest_q >= -(1LL << 27) &&
+                217706LL * pow5_largest_q < (1LL << 27), "cached exponent exceeds floor-division bounds");
   const int product = 217706 * q;
-  int e = (product >= 0 ? product / 65536 : -((-product + 65535) / 65536)) + 63 + upper - z + B::bias;
+  int e = int(u32(product + (1 << 27)) >> 16) - 2048 + 63 + upper - z + B::bias;
   // A discarded decimal tail is strictly between 0 and 1 mantissa unit.
   // In this normalized product it can advance the high word by at most 2^z;
   // one extra unit covers the cached-product approximation. A 19-digit
@@ -341,27 +367,39 @@ CHFLOAT_NOINLINE inline int compare_decimal_midpoint(const decimal& d, const cha
     while (power >= 29) { multiply(u32(1) << 29); power -= 29; }
     multiply(u32(1) << power);
   }
-  u32 divisor = 1;
   int top_digits = 1;
-  while (limbs[used - 1] / divisor >= 10) { divisor *= 10; ++top_digits; }
+  for (u32 top = limbs[used - 1]; top >= 10; top /= 10) ++top_digits;
   const i64 order = (used - 1) * 9 + top_digits + scale;
   const i64 input_order = d.exp10 + d.digits; // Called only for bounded exp10.
   if (input_order != order) return input_order < order ? -1 : 1;
-  const char* p = first;
-  while (p != end && (*p == '0' || *p == '.')) ++p;
+  const char* p = skip_zeroes(first, end);
+  if (p != end && *p == '.') p = skip_zeroes(p + 1, end);
   for (int i = used - 1; i >= 0; --i) {
-    u32 n = limbs[i];
-    do {
+    u32 input = 0;
+    int remaining = top_digits;
+    while (remaining) {
       if (p != end && *p == '.') ++p;
-      const unsigned a = p == end ? 0 : digit(*p++);
-      const unsigned b = n / divisor;
-      if (a != b) return a < b ? -1 : 1;
-      n %= divisor;
-      divisor /= 10;
-    } while (divisor);
-    divisor = 100000000;
+      if (remaining >= 8 && end - p >= 8) {
+        const u64 word = load_u64_unaligned(p);
+        if (all_8_digits(word)) {
+          input = input * 100000000 + parse_8_digits(word);
+          p += 8;
+          remaining -= 8;
+          continue;
+        }
+      }
+      input = input * 10 + (p == end ? 0 : digit(*p++));
+      --remaining;
+    }
+    if (input != limbs[i]) return input < limbs[i] ? -1 : 1;
+    top_digits = 9;
   }
-  while (p != end) { if (*p != '.' && *p != '0') return 1; ++p; }
+  while (p != end) {
+    if (*p == '.') { ++p; continue; }
+    const char* next = skip_zeroes(p, end);
+    if (next == p) return 1;
+    p = next;
+  }
   return 0;
 }
 template <class T> inline int compare_midpoint(const decimal& d, const char* first, const char* end, u64 lower) noexcept {
@@ -378,8 +416,8 @@ template <class T> inline int compare_midpoint(const decimal& d, const char* fir
 template <class T> CHFLOAT_NOINLINE inline u64 correct_rounding(const decimal& d, const char* first, u64 bits,
                                                               bool check_lower) noexcept {
   using B = binary_traits<T>;
-  const char* end = first;
-  while (end != d.ptr && (is_digit(*end) || *end == '.')) ++end;
+  const char* end = skip_decimal_digits(first, d.ptr);
+  if (end != d.ptr && *end == '.') end = skip_decimal_digits(end + 1, d.ptr);
   if (check_lower && bits != 0) {
     const int below = compare_midpoint<T>(d, first, end, bits - 1);
     if (below < 0 || (below == 0 && (bits & 1))) return bits - 1;

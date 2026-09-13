@@ -47,6 +47,7 @@ inline from_chars_result parse_integer(const char* first, const char* last, T& o
     }
   }
   const char* digits = p;
+  if (*p == '0') p = skip_zeroes(p, last);
   const U limit = std::is_signed<T>::value
                       ? U(U((std::numeric_limits<T>::max)()) + U(neg))
                       : (std::numeric_limits<U>::max)();
@@ -55,18 +56,40 @@ inline from_chars_result parse_integer(const char* first, const char* last, T& o
   const U cutoff = U(limit / radix);
   const unsigned cutlim = static_cast<unsigned>(limit % radix);
   U value = 0;
+  // Eight decimal digits fit every 32-bit destination; sixteen fit every
+  // 64-bit destination. Only subsequent digits need per-digit range checks.
+  if constexpr (Decimal && sizeof(U) >= 4) {
+    if (last - p >= 8) {
+      const u64 word = load_u64_unaligned(p);
+      if (all_8_digits(word)) {
+        value = U(parse_8_digits(word));
+        p += 8;
+        if constexpr (sizeof(U) >= 8) {
+          if (last - p >= 8) {
+            const u64 next = load_u64_unaligned(p);
+            if (all_8_digits(next)) {
+              value = U(value * U(100000000) + U(parse_8_digits(next)));
+              p += 8;
+            }
+          }
+        }
+      }
+    }
+  }
   while (p != last) {
     const unsigned d = Decimal ? unsigned(static_cast<unsigned char>(*p)) - '0'
                                : integer_digits.values[static_cast<unsigned char>(*p)];
     if (d >= static_cast<unsigned>(radix)) break;
     if (value > cutoff || (value == cutoff && d > cutlim)) {
-      do {
-        ++p;
-        if (p == last) break;
-        const unsigned next = Decimal ? unsigned(static_cast<unsigned char>(*p)) - '0'
-            : integer_digits.values[static_cast<unsigned char>(*p)];
-        if (next >= static_cast<unsigned>(radix)) break;
-      } while (true);
+      if constexpr (Decimal) {
+        p = skip_decimal_digits(p + 1, last);
+      } else {
+        do {
+          ++p;
+          if (p == last) break;
+          if (integer_digits.values[static_cast<unsigned char>(*p)] >= static_cast<unsigned>(radix)) break;
+        } while (true);
+      }
       return {p, errc::result_out_of_range};
     }
     value = U(value * radix + U(d));

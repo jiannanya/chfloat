@@ -49,8 +49,11 @@ int main() {
   // Allocate the adversarial inputs before measuring parser allocations.
   const std::string long_input = "0." + std::string(2 * 1024 * 1024, '0') + "1e2097153";
   const std::string halfway = "1.00000000000000011102230246251565404236316680908203125" + std::string(100000, '0') + "1";
+  const std::string long_integer = std::string(2 * 1024 * 1024, '0') + "9223372036854775807";
+  const std::string overflowing_integer(200000, '9');
   const char* inputs[] = {"12.5", "1e308", "1e-308", "4.9406564584124654e-324", "1e99999", "nan(payload)", "infinity", "abc",
-                          "1.00000005960464477539062500001", long_input.c_str(), halfway.c_str()};
+                          "1.00000005960464477539062500001", long_input.c_str(), halfway.c_str(),
+                          long_integer.c_str(), overflowing_integer.c_str()};
   tracking = true;
   bool valid = true;
   for (const char* text : inputs) {
@@ -61,6 +64,14 @@ int main() {
     sink = d;
     if (text == long_input.c_str()) valid &= rd.ec == chfloat::errc::ok && d == 1;
     chfloat::from_chars(text, end, d, chfloat::chars_format::hex);
+    long long integer = 37;
+    const auto ri = chfloat::from_chars(text, end, integer);
+    if (text == long_integer.c_str()) valid &= ri.ec == chfloat::errc::ok && ri.ptr == end && integer == 9223372036854775807LL;
+    if (text == overflowing_integer.c_str()) valid &= ri.ec == chfloat::errc::result_out_of_range && ri.ptr == end && integer == 37;
+    for (int base : {2, 16, 36}) {
+      unsigned long long u = 0;
+      chfloat::from_chars(text, end, u, base);
+    }
   }
   tracking = false;
   std::printf("parser heap allocations: %zu; long-input result: %s\n", allocations.load(), valid ? "correct" : "incorrect");

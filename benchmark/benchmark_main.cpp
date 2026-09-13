@@ -192,12 +192,17 @@ struct options {
   int cpu = -1;
   std::string report = "report/benchmark.md", scenario;
 };
-struct scenario { const char* name; int int_max, frac_max, exp_min, exp_max, base; };
+enum class input_shape { normal, leading_zeroes, large_exponent, zero_exponent, integer_overflow, midpoint_tail };
+struct scenario {
+  const char* name;
+  int int_max, frac_max, exp_min, exp_max, base;
+  input_shape shape = input_shape::normal;
+};
 dataset generate(const scenario& sc, const options& opt) {
   std::mt19937_64 rng(opt.seed);
   dataset data;
   data.offsets.reserve(opt.n);
-  data.bytes.reserve(opt.n * std::size_t(sc.int_max + sc.frac_max + 16));
+  data.bytes.reserve(opt.n * std::size_t(sc.int_max + sc.frac_max + 16 + (sc.shape == input_shape::normal ? 0 : 320)));
   for (std::size_t i = 0; i < opt.n; ++i) {
     std::string s;
     if (sc.base) {
@@ -216,6 +221,22 @@ dataset generate(const scenario& sc, const options& opt) {
       }
       const int exponent = sc.exp_min + int(rng() % unsigned(sc.exp_max - sc.exp_min + 1));
       if (exponent) { s += 'e'; s += std::to_string(exponent); }
+    }
+    switch (sc.shape) {
+      case input_shape::leading_zeroes: s.insert(s[0] == '-' ? 1 : 0, 256, '0'); break;
+      case input_shape::large_exponent:
+        s += rng() & 1 ? "e+" : "e-";
+        s.append(256, '9');
+        break;
+      case input_shape::zero_exponent: s += "e-"; s.append(256, '0'); s += '2'; break;
+      case input_shape::integer_overflow: s.append(256, '9'); break;
+      case input_shape::midpoint_tail:
+        s = rng() & 1 ? "1.000000059604644775390625" : "1.00000000000000011102230246251565404236316680908203125";
+        s.append(128 + rng() % 128, '0');
+        s += char('0' + rng() % 10);
+        if (rng() & 1) s.insert(s.begin(), '-');
+        break;
+      default: break;
     }
     data.append(s);
   }
@@ -275,11 +296,17 @@ int main(int argc, char** argv) try {
     else throw std::runtime_error("unknown option: " + std::string(key));
   }
   if (!opt.n || !opt.iters || !opt.runs) throw std::runtime_error("n, iters and runs must be positive");
-  if (opt.n > (std::numeric_limits<std::size_t>::max)() / 128 || opt.iters > (std::numeric_limits<std::size_t>::max)() / opt.n)
+  if (opt.n > (std::numeric_limits<std::size_t>::max)() / 512 || opt.iters > (std::numeric_limits<std::size_t>::max)() / opt.n)
     throw std::runtime_error("requested workload is too large");
   const scenario scenarios[] = {
     {"mixed", 8, 8, -30, 30, 0}, {"short_no_exp", 6, 2, 0, 0, 0}, {"long_frac", 16, 32, -30, 30, 0},
-    {"wide_range", 19, 60, -350, 310, 0}, {"integer_decimal", 20, 0, 0, 0, 10}, {"integer_hex", 16, 0, 0, 0, 16}
+    {"wide_range", 19, 60, -350, 310, 0}, {"integer_decimal", 20, 0, 0, 0, 10}, {"integer_hex", 16, 0, 0, 0, 16},
+    {"leading_zeroes", 8, 8, 0, 0, 0, input_shape::leading_zeroes},
+    {"large_exponent", 8, 8, 0, 0, 0, input_shape::large_exponent},
+    {"zero_exponent", 8, 8, 0, 0, 0, input_shape::zero_exponent},
+    {"integer_overflow", 20, 0, 0, 0, 10, input_shape::integer_overflow},
+    {"integer_zeroes", 20, 0, 0, 0, 10, input_shape::leading_zeroes},
+    {"midpoint_tail", 8, 8, 0, 0, 0, input_shape::midpoint_tail}
   };
   bool selected = opt.scenario.empty();
   for (const auto& sc : scenarios) selected |= opt.scenario == sc.name;
@@ -299,6 +326,11 @@ int main(int argc, char** argv) try {
   report << "Cached powers: compact (5,208 bytes).\n\n";
 #else
   report << "Cached powers: full (10,416 bytes).\n\n";
+#endif
+#ifdef CHFLOAT_FORCE_PORTABLE
+  report << "Arithmetic: portable scalar operations.\n\n";
+#else
+  report << "Arithmetic: platform default.\n\n";
 #endif
   report << "Thread affinity mask: " << affinity << " (0 means not pinned).\n\n";
 #ifdef CHFLOAT_HAS_REFERENCE
