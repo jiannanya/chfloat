@@ -68,7 +68,7 @@ cmake --build build-release --parallel
 ctest --test-dir build-release --output-on-failure
 ```
 
-Tests cover differential parsing against `std::from_chars`, random binary round trips, independently generated exact decimal midpoints, all integer bases, malformed byte buffers, signed zero, long inputs, rounding modes, portable arithmetic, compact tables, and heap allocation counting. The test executables require a standard library with C++17 floating `from_chars` and `to_chars`; the library itself does not depend on these functions.
+Tests cover differential parsing against `std::from_chars`, random binary round trips, independently generated exact decimal midpoints, all integer bases, malformed byte buffers, signed zero, long inputs, rounding modes, portable arithmetic, compact tables, heap allocation counting, and concurrent parsing against a single-threaded reference. A comparison against `std::from_chars` is skipped when the standard library returns a demonstrably non-conforming result, such as stopping in the middle of a digit run or reporting a non-finite value for finite input; the skip count is printed so the exclusions stay visible. The test executables require a standard library with C++17 floating `from_chars` and `to_chars`; the library itself does not depend on these functions.
 
 For address and undefined-behavior sanitizers on Linux:
 
@@ -90,6 +90,10 @@ On Windows this option enables ASan only. The installed sanitizer runtime must s
 Define these macros before including the header. Compact mode can also be enabled with `-DCHFLOAT_COMPACT=ON` in CMake. **Use the same macro configuration in every translation unit.**
 
 The parser has no mutable global state; threads may parse separate inputs and destinations concurrently.
+
+### Footprint
+
+The cached-power table is the only static data: 10,416 bytes by default, 5,208 bytes with `CHFLOAT_COMPACT=1`. Parsing allocates nothing from the heap and consumes a constant amount of stack; the widest path, exact decimal/midpoint comparison, uses a fixed 344-byte scratch buffer for `double` (52 bytes for `float`), independent of input length.
 
 ## Integration
 

@@ -56,6 +56,7 @@ inline from_chars_result parse_integer(const char* first, const char* last, T& o
   const U cutoff = U(limit / radix);
   const unsigned cutlim = static_cast<unsigned>(limit % radix);
   U value = 0;
+  int blocks = 0;
   // Eight decimal digits fit every 32-bit destination; sixteen fit every
   // 64-bit destination. Only subsequent digits need per-digit range checks.
   if constexpr (Decimal && sizeof(U) >= 4) {
@@ -70,6 +71,28 @@ inline from_chars_result parse_integer(const char* first, const char* last, T& o
             if (all_8_digits(next)) {
               value = U(value * U(100000000) + U(parse_8_digits(next)));
               p += 8;
+            }
+          }
+        }
+      }
+    }
+  } else if constexpr (!Decimal && sizeof(U) >= 4) {
+    // Hexadecimal blocks: eight digits for every 32/64-bit destination, plus a
+    // second block for 64-bit ones. A block may already exceed the destination
+    // range, which the post-loop check below reports.
+    if (base == 16 && last - p >= 8) {
+      const u64 word = load_u64_unaligned(p);
+      if (all_8_hex(word)) {
+        value = U(parse_8_hex(word));
+        p += 8;
+        blocks = 8;
+        if constexpr (sizeof(U) >= 8) {
+          if (last - p >= 8) {
+            const u64 next = load_u64_unaligned(p);
+            if (all_8_hex(next)) {
+              value = U(value << 32) | U(parse_8_hex(next));
+              p += 8;
+              blocks = 16;
             }
           }
         }
@@ -95,6 +118,9 @@ inline from_chars_result parse_integer(const char* first, const char* last, T& o
     value = U(value * radix + U(d));
     ++p;
   }
+  // A full hexadecimal block can already exceed the destination range without
+  // leaving another digit to trigger the loop's guard above.
+  if (blocks != 0 && value > limit) return {p, errc::result_out_of_range};
   if (p == digits) return {first, errc::invalid_argument};
   if constexpr (std::is_signed<T>::value) {
     // Subtract before conversion to represent the signed minimum portably.

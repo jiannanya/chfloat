@@ -90,6 +90,25 @@ inline u32 parse_8_digits(u64 v) noexcept {
   v = (v * 100 + (v >> 16)) & 0x0000ffff0000ffffULL;
   return u32(v * 10000 + (v >> 32));
 }
+// Hexadecimal counterparts of the decimal block helpers. The validator accepts
+// only ASCII bytes; for those, all lanes stay below 0x80, so the two range
+// probes are carry-free additions and remain exact per byte.
+inline bool all_8_hex(u64 v) noexcept {
+  constexpr u64 ones = 0x0101010101010101ULL;
+  constexpr u64 highs = 0x8080808080808080ULL;
+  if (v & highs) return false;
+  const u64 upper = v & 0xdfdfdfdfdfdfdfdfULL; // letters become 'A'-'F'
+  const u64 digit = ((v + ones * 0x50) & ~(v + ones * 0x46)) & highs;
+  const u64 alpha = ((upper + ones * 0x3f) & ~(upper + ones * 0x39)) & highs;
+  return (digit | alpha) == highs;
+}
+inline u32 parse_8_hex(u64 v) noexcept {
+  u64 t = v | 0x2020202020202020ULL; // letters become 'a'-'f', digits unchanged
+  t = (t & 0x0f0f0f0f0f0f0f0fULL) + 9 * ((t >> 6) & 0x0101010101010101ULL);
+  t = (t * 16 + (t >> 8)) & 0x00ff00ff00ff00ffULL;
+  t = (t * 256 + (t >> 16)) & 0x0000ffff0000ffffULL;
+  return u32(t * 65536 + (t >> 32));
+}
 inline unsigned digit(char c) noexcept { return unsigned(static_cast<unsigned char>(c)) - '0'; }
 inline bool is_digit(char c) noexcept { return digit(c) < 10; }
 inline const char* skip_zeroes(const char* p, const char* last) noexcept {
@@ -100,6 +119,39 @@ inline const char* skip_zeroes(const char* p, const char* last) noexcept {
 inline const char* skip_decimal_digits(const char* p, const char* last) noexcept {
   while (last - p >= 8 && all_8_digits(load_u64_unaligned(p))) p += 8;
   while (p != last && is_digit(*p)) ++p;
+  return p;
+}
+// Append up to nineteen significant decimal digits, eight at a time while the
+// significand still has room for a full block. `digits` counts the significant
+// digits accumulated so far and is updated in place, so the fixed-width block
+// and the per-digit tail share one budget and the significand cannot wrap.
+CHFLOAT_FORCEINLINE u64 append_decimal_digits(u64 mant, const char*& p, const char* last,
+                                              int& digits) noexcept {
+  while (digits <= 11 && last - p >= 8) {
+    const u64 word = load_u64_unaligned(p);
+    if (!all_8_digits(word)) break;
+    mant = mant * 100000000 + parse_8_digits(word);
+    digits += 8;
+    p += 8;
+  }
+  while (digits < 19 && p != last && is_digit(*p)) {
+    mant = mant * 10 + digit(*p++);
+    ++digits;
+  }
+  return mant;
+}
+// Consume decimal digits that no longer fit the significand, recording whether
+// any of them was nonzero. Every eight-digit block is tested with one load, and
+// the sticky bit is folded into a register instead of a field of `decimal`.
+CHFLOAT_FORCEINLINE const char* drop_decimal_digits(const char* p, const char* last,
+                                                    u64& sticky) noexcept {
+  while (last - p >= 8) {
+    const u64 word = load_u64_unaligned(p);
+    if (!all_8_digits(word)) break;
+    sticky |= word ^ 0x3030303030303030ULL;
+    p += 8;
+  }
+  while (p != last && is_digit(*p)) sticky |= u64(static_cast<unsigned char>(*p++)) ^ u64('0');
   return p;
 }
 inline i64 saturated_add(i64 a, i64 b) noexcept {
@@ -162,16 +214,16 @@ CHFLOAT_FORCEINLINE decimal scan_decimal(const char* p, const char* last, unsign
   if (p != last && *p == '0') p = skip_zeroes(p, last);
   if (last - p <= 19) {
     // The bounded range cannot overflow the significand; omit per-digit budget
-    // checks and tail scanning for short numbers.
+    // checks and tail scanning for short numbers. Fixed-width blocks do not pay
+    // off here: most short numbers never fill one, and the extra probe costs
+    // more than the digits it would batch.
     const char* significant = p;
     while (p != last && is_digit(*p)) d.mant = d.mant * 10 + digit(*p++);
     d.digits = int(p - significant);
     d.valid = p != integer;
     if (p != last && *p == '.') {
       const char* fraction = ++p;
-      if (!d.mant) {
-        p = skip_zeroes(p, last);
-      }
+      if (!d.mant) p = skip_zeroes(p, last);
       const char* significant_fraction = p;
       while (p != last && is_digit(*p)) d.mant = d.mant * 10 + digit(*p++);
       d.digits += int(p - significant_fraction);
@@ -180,23 +232,10 @@ CHFLOAT_FORCEINLINE decimal scan_decimal(const char* p, const char* last, unsign
     }
     return finish_decimal(d, p, last, fmt);
   }
-  while (last - p >= 8 && d.digits <= 11) {
-    const u64 word = load_u64_unaligned(p);
-    if (!all_8_digits(word)) break;
-    d.mant = d.mant * 100000000 + parse_8_digits(word);
-    d.digits += 8;
-    p += 8;
-  }
-  while (p != last && is_digit(*p) && d.digits < 19) {
-    d.mant = d.mant * 10 + digit(*p++);
-    ++d.digits;
-  }
+  d.mant = append_decimal_digits(0, p, last, d.digits);
   const char* dropped = p;
-  while (last - p >= 8 && all_8_digits(load_u64_unaligned(p))) {
-    d.truncated |= load_u64_unaligned(p) != 0x3030303030303030ULL;
-    p += 8;
-  }
-  while (p != last && is_digit(*p)) d.truncated |= *p++ != '0';
+  u64 sticky = 0;
+  p = drop_decimal_digits(p, last, sticky);
   d.exp10 = p - dropped;
   bool any = p != integer;
   if (p != last && *p == '.') {
@@ -206,27 +245,14 @@ CHFLOAT_FORCEINLINE decimal scan_decimal(const char* p, const char* last, unsign
       p = skip_zeroes(p, last);
       d.exp10 -= p - zeroes;
     }
-    while (last - p >= 8 && d.digits <= 11) {
-      const u64 word = load_u64_unaligned(p);
-      if (!all_8_digits(word)) break;
-      d.mant = d.mant * 100000000 + parse_8_digits(word);
-      d.digits += 8;
-      d.exp10 -= 8;
-      p += 8;
-    }
-    while (p != last && is_digit(*p) && d.digits < 19) {
-      d.mant = d.mant * 10 + digit(*p++);
-      ++d.digits;
-      --d.exp10;
-    }
+    const char* fraction_digits = p;
+    d.mant = append_decimal_digits(d.mant, p, last, d.digits);
+    d.exp10 -= p - fraction_digits;
     // Discarded fractional digits do not change the prefix's exponent.
-    while (last - p >= 8 && all_8_digits(load_u64_unaligned(p))) {
-      d.truncated |= load_u64_unaligned(p) != 0x3030303030303030ULL;
-      p += 8;
-    }
-    while (p != last && is_digit(*p)) d.truncated |= *p++ != '0';
+    p = drop_decimal_digits(p, last, sticky);
     any |= p != fraction;
   }
+  d.truncated = sticky != 0;
   d.valid = any;
   return finish_decimal(d, p, last, fmt);
 }

@@ -53,6 +53,7 @@ endfunction()
 
 if(CHFLOAT_BUILD_TESTS)
   enable_testing()
+  find_package(Threads REQUIRED)
   foreach(target chfloat_tests chfloat_portable_tests chfloat_compact_tests)
     add_executable(${target} test/test_main.cpp)
     target_link_libraries(${target} PRIVATE chfloat::chfloat)
@@ -65,6 +66,12 @@ if(CHFLOAT_BUILD_TESTS)
   target_link_libraries(chfloat_memory_tests PRIVATE chfloat::chfloat)
   chfloat_configure_target(chfloat_memory_tests)
   add_test(NAME chfloat_memory_tests COMMAND chfloat_memory_tests)
+  # The parser has no mutable global state; this executable checks concurrent
+  # use against a single-threaded reference and reports aggregate throughput.
+  add_executable(chfloat_concurrency_tests test/concurrency_main.cpp)
+  target_link_libraries(chfloat_concurrency_tests PRIVATE chfloat::chfloat Threads::Threads)
+  chfloat_configure_target(chfloat_concurrency_tests)
+  add_test(NAME chfloat_concurrency_tests COMMAND chfloat_concurrency_tests)
 endif()
 
 if(CHFLOAT_BUILD_BENCHMARKS)

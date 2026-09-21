@@ -17,6 +17,7 @@ namespace {
 #include "midpoint_cases.h"
 int failures = 0;
 std::uint64_t comparisons = 0;
+std::uint64_t oracle_skips = 0;
 #define CHECK(expr) do { if (!(expr)) { if (failures < 30) std::fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #expr); ++failures; } } while (false)
 template <class T> std::uint64_t bits(T value) {
   std::uint64_t result = 0;
@@ -37,9 +38,36 @@ template <class T> void compare(std::string_view s, chfloat::chars_format fmt = 
   const char* last = first + s.size();
   // chfloat intentionally retains its leading-plus extension.
   const char* oracle = first != last && *first == '+' ? first + 1 : first;
-  auto want = std::from_chars(oracle, last, expected, std_format(fmt));
+  const char* oracle_last = last;
+  if (fmt == chfloat::chars_format::fixed) {
+    // `fixed` must not consume an exponent part. Some standard libraries do so
+    // for long inputs, so restrict the oracle to the plain-decimal prefix:
+    // that prefix is exactly what a conforming fixed parse must consume.
+    const char* q = oracle;
+    bool seen_digit = false;
+    if (q != last && (*q == '+' || *q == '-')) ++q;
+    for (; q != last; ++q) {
+      if (*q >= '0' && *q <= '9') { seen_digit = true; continue; }
+      if (*q == '.') continue;
+      if ((*q == 'e' || *q == 'E') && seen_digit) oracle_last = q;
+      break;
+    }
+  }
+  auto want = std::from_chars(oracle, oracle_last, expected, std_format(fmt));
   if (oracle != first && oracle != last && (*oracle == '+' || *oracle == '-')) want.ec = std::errc::invalid_argument;
   if (want.ec == std::errc::invalid_argument) want.ptr = first;
+  // Reject unusable oracle results before comparing. A conforming parse never
+  // stops in the middle of a digit run, and never reports success with a
+  // non-finite value for a finite decimal input; some standard libraries do
+  // both. Specials such as "inf"/"nan" are excluded from the second test.
+  const char* probe = oracle;
+  if (probe != last && (*probe == '+' || *probe == '-')) ++probe;
+  const bool decimal_input = probe != last && ((*probe >= '0' && *probe <= '9') || *probe == '.');
+  if ((decimal_input && want.ec == std::errc{} && !std::isfinite(expected)) ||
+      (want.ptr != last && *want.ptr >= '0' && *want.ptr <= '9')) {
+    ++oracle_skips;
+    return;
+  }
   // Older MSVC libraries overwrite the destination on range errors.
   if (want.ec != std::errc{}) expected = T(123);
   auto got = chfloat::from_chars(first, last, actual, fmt);
@@ -304,7 +332,7 @@ void long_run_boundaries() {
   }
   CHECK(chfloat::detail::lz64(0) == 64);
 }
-template <class T> void compare_integer_buffer(std::string_view s) {
+template <class T> void compare_integer_buffer(std::string_view s, int base = 10) {
   const char* first = s.data();
   const char* last = first + s.size();
   const char* oracle = first;
@@ -312,10 +340,10 @@ template <class T> void compare_integer_buffer(std::string_view s) {
     if (first != last && *first == '+') ++oracle;
   }
   T expected = 123, value = 123;
-  auto want = std::from_chars(oracle, last, expected);
+  auto want = std::from_chars(oracle, last, expected, base);
   if (oracle != first && oracle != last && (*oracle == '+' || *oracle == '-')) want.ec = std::errc::invalid_argument;
   if (want.ec == std::errc::invalid_argument) want.ptr = first;
-  const auto got = chfloat::from_chars(first, last, value);
+  const auto got = chfloat::from_chars(first, last, value, base);
   const auto ec = want.ec == std::errc{} ? chfloat::errc::ok :
       want.ec == std::errc::invalid_argument ? chfloat::errc::invalid_argument : chfloat::errc::result_out_of_range;
   CHECK(got.ec == ec && got.ptr == want.ptr && value == (want.ec == std::errc{} ? expected : T(123)));
@@ -342,6 +370,51 @@ void integer_byte_boundaries() {
     delete[] raw;
   }
 }
+void integer_hex_boundaries() {
+  // The hexadecimal block parser reads eight bytes at a time; cover every byte
+  // value at every position around the 8/16-digit block boundaries.
+  constexpr char number[] = "1234567890abcdef0011";
+  for (std::size_t length : {1u, 7u, 8u, 9u, 15u, 16u, 17u, 19u, 20u}) {
+    char* raw = new char[length];
+    std::memcpy(raw, number, length);
+    for (std::size_t pos = 0; pos < length; ++pos) {
+      for (unsigned c = 0; c < 256; ++c) {
+        raw[pos] = static_cast<char>(c);
+        const std::string_view text(raw, length);
+        compare_integer_buffer<std::int32_t>(text, 16);
+        compare_integer_buffer<std::uint32_t>(text, 16);
+        compare_integer_buffer<std::int64_t>(text, 16);
+        compare_integer_buffer<std::uint64_t>(text, 16);
+      }
+      raw[pos] = number[pos];
+    }
+    delete[] raw;
+  }
+}
+void hex_block_helpers() {
+  // Exhaustively check the eight-digit probe and value conversion for every
+  // byte in every lane against a scalar reference.
+  for (unsigned c = 0; c < 256; ++c) {
+    for (int lane = 0; lane < 8; ++lane) {
+      char raw[8];
+      std::memcpy(raw, "12345678", sizeof(raw));
+      raw[lane] = static_cast<char>(c);
+      std::uint64_t word = 0;
+      std::memcpy(&word, raw, sizeof(word));
+      bool valid = true;
+      unsigned expected = 0;
+      for (int i = 0; i < 8; ++i) {
+        const unsigned d = static_cast<unsigned char>(raw[i]);
+        if (d >= '0' && d <= '9') expected = expected * 16 + (d - '0');
+        else if (d >= 'a' && d <= 'f') expected = expected * 16 + (d - 'a' + 10);
+        else if (d >= 'A' && d <= 'F') expected = expected * 16 + (d - 'A' + 10);
+        else valid = false;
+      }
+      CHECK(chfloat::detail::all_8_hex(word) == valid);
+      if (valid) CHECK(chfloat::detail::parse_8_hex(word) == expected);
+    }
+  }
+}
 } // namespace
 int main(int argc, char** argv) {
   std::size_t count = 50000;
@@ -360,12 +433,15 @@ int main(int argc, char** argv) {
   arbitrary_buffers();
   long_run_boundaries();
   integer_byte_boundaries();
+  integer_hex_boundaries();
+  hex_block_helpers();
   for (unsigned i = 0; i < 256; ++i) {
     unsigned value = 99;
     const bool valid = chfloat::parse_digit(static_cast<char>(i), value);
     CHECK(valid == (i >= '0' && i <= '9'));
     CHECK(value == (valid ? i - '0' : 99));
   }
-  std::printf("%llu comparisons, %d failures\n", (unsigned long long)comparisons, failures);
+  std::printf("%llu comparisons, %d failures, %llu oracle comparisons skipped\n",
+              (unsigned long long)comparisons, failures, (unsigned long long)oracle_skips);
   return failures ? 1 : 0;
 }
