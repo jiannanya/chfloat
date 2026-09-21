@@ -89,7 +89,7 @@ On Windows this option enables ASan only. The installed sanitizer runtime must s
 
 Define these macros before including the header. Compact mode can also be enabled with `-DCHFLOAT_COMPACT=ON` in CMake. **Use the same macro configuration in every translation unit.**
 
-The parser has no mutable global state; threads may parse separate inputs and destinations concurrently.
+The parser has no mutable global state; threads may parse separate inputs and destinations concurrently. It reads the hardware floating-point control register (MXCSR on x86-64, FPCR on AArch64) only to decide whether short decimals may take a guarded fast path; every other target, and `CHFLOAT_FORCE_PORTABLE=1`, uses the integer path for all inputs.
 
 ### Footprint
 

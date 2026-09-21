@@ -24,6 +24,25 @@ template <class T> std::uint64_t bits(T value) {
   std::memcpy(&result, &value, sizeof(T));
   return result;
 }
+#if (defined(_M_ARM64) || defined(__aarch64__)) && !defined(CHFLOAT_FORCE_PORTABLE)
+unsigned test_read_fpcr() noexcept {
+#if defined(_MSC_VER)
+  return static_cast<unsigned>(_ReadStatusReg(ARM64_FPCR));
+#else
+  std::uint64_t value = 0;
+  __asm__ __volatile__("mrs %0, fpcr" : "=r"(value));
+  return static_cast<unsigned>(value);
+#endif
+}
+void test_write_fpcr(unsigned value) noexcept {
+#if defined(_MSC_VER)
+  _WriteStatusReg(ARM64_FPCR, static_cast<std::uint64_t>(value));
+#else
+  const std::uint64_t wide = value;
+  __asm__ __volatile__("msr fpcr, %0" : : "r"(wide));
+#endif
+}
+#endif
 std::chars_format std_format(chfloat::chars_format fmt) {
   switch (fmt) {
     case chfloat::chars_format::fixed: return std::chars_format::fixed;
@@ -266,6 +285,19 @@ void short_decimal_rounding() {
   _mm_setcsr(previous_csr);
   CHECK(result.ec == chfloat::errc::ok && bits(d) == 0x3fb999999999999aULL);
   CHECK((resulting_csr & 0x3fu) == 0);
+#elif (defined(_M_ARM64) || defined(__aarch64__)) && !defined(CHFLOAT_FORCE_PORTABLE)
+  // Enable the inexact trap (FPCR IXE) and clear the cumulative exception
+  // flags. The parser must notice the unmasked exception, stay on its integer
+  // path, and not raise a floating-point trap for decimal 0.1.
+  const unsigned previous_fpcr = test_read_fpcr();
+  test_write_fpcr((previous_fpcr & ~(0x9f00u | 0x9fu)) | (1u << 12));
+  const char text[] = "0.1";
+  double d = 0;
+  const auto result = chfloat::from_chars(text, text + 3, d);
+  const unsigned resulting_fpcr = test_read_fpcr();
+  test_write_fpcr(previous_fpcr);
+  CHECK(result.ec == chfloat::errc::ok && bits(d) == 0x3fb999999999999aULL);
+  CHECK((resulting_fpcr & 0x9fu) == 0);
 #endif
   std::fesetround(original);
 }

@@ -8,7 +8,7 @@
 #if (defined(_M_X64) || defined(__x86_64__)) && !defined(CHFLOAT_FORCE_PORTABLE)
 #include <xmmintrin.h>
 #endif
-#if defined(_MSC_VER) && defined(_M_X64) && !defined(CHFLOAT_FORCE_PORTABLE)
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64)) && !defined(CHFLOAT_FORCE_PORTABLE)
 #include <intrin.h>
 #endif
 
@@ -38,6 +38,9 @@ inline int lz64(u64 x) noexcept {
   unsigned long index;
   if (!_BitScanReverse64(&index, x)) return 64;
   return 63 - static_cast<int>(index);
+#elif defined(_MSC_VER) && defined(_M_ARM64) && !defined(CHFLOAT_FORCE_PORTABLE)
+  if (!x) return 64;
+  return static_cast<int>(_CountLeadingZeros64(x));
 #elif (defined(__GNUC__) || defined(__clang__)) && !defined(CHFLOAT_FORCE_PORTABLE)
   return x ? __builtin_clzll(x) : 64;
 #else
@@ -279,11 +282,29 @@ template <class T> inline T from_bits(u64 bits) noexcept {
   std::memcpy(&value, &u, sizeof(value));
   return value;
 }
+inline u32 read_fpcr() noexcept {
+#if defined(_MSC_VER) && defined(_M_ARM64) && !defined(CHFLOAT_FORCE_PORTABLE)
+  return static_cast<u32>(_ReadStatusReg(ARM64_FPCR));
+#elif defined(__aarch64__) && !defined(CHFLOAT_FORCE_PORTABLE)
+  u64 value;
+  __asm__ __volatile__("mrs %0, fpcr" : "=r"(value));
+  return static_cast<u32>(value);
+#else
+  return 0;
+#endif
+}
 inline bool nearest_rounding_without_traps() noexcept {
 #if (defined(_M_X64) || (defined(__x86_64__) && defined(__SSE2_MATH__))) && !defined(CHFLOAT_FORCE_PORTABLE) && !defined(__FAST_MATH__) && !defined(_M_FP_FAST)
   // Check the actual SSE rounding mode and exception masks on every call.
   // Directed rounding or unmasked exceptions use the integer conversion path.
   return (_mm_getcsr() & 0x7f80u) == 0x1f80u;
+#elif (defined(_M_ARM64) || defined(__aarch64__)) && !defined(CHFLOAT_FORCE_PORTABLE) && !defined(__FAST_MATH__) && !defined(_M_FP_FAST)
+  // Same check against the AArch64 control register: RMode must be round to
+  // nearest, ties to even (bits 23:22), and every exception trap disabled
+  // (IDE, IXE, UFE, OFE, DZE, IOE). Flush-to-zero is irrelevant here: the
+  // shortcut only scales values of magnitude 1e-2 and above.
+  constexpr u32 checked = (u32(3) << 22) | (u32(1) << 15) | (u32(0x1f) << 8);
+  return (read_fpcr() & checked) == 0;
 #else
   return false;
 #endif
